@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -24,6 +25,46 @@ from nautilus_trader.adapters.binance.common.enums import BinanceEnvironment
 
 from data_clients.factory import MarketSnapshotDataClientFactory
 from data_clients.liquidation_factory import LiquidationWsDataClientFactory
+
+import subprocess
+import threading
+
+
+def _stop_dinleyici():
+    while True:
+        satir = input().strip().lower()
+        if satir != 's':
+            continue
+
+        cevap = input("Programı kapatmak istiyor musunuz? (Y/N): ").strip().lower()
+        if cevap not in ('y', 'yes', 'evet', 'e'):
+            print("İptal edildi, çalışmaya devam ediliyor.")
+            continue
+
+        print("Veritabanı GitHub'a yedekleniyor...")
+        proje_kok = os.path.dirname(os.path.abspath(__file__))
+        try:
+            subprocess.run(["git", "add", "."], cwd=proje_kok, check=True)
+            commit_sonuc = subprocess.run(
+                ["git", "commit", "-m", "Otomatik yedekleme (stop)"],
+                cwd=proje_kok, capture_output=True, text=True,
+            )
+            if commit_sonuc.returncode != 0:
+                print("(Commit edilecek yeni değişiklik yok, devam ediliyor.)")
+            subprocess.run(["git", "push"], cwd=proje_kok, check=True)
+            print("Yedekleme tamamlandı.")
+        except subprocess.CalledProcessError as e:
+            print(f"Git işlemi başarısız oldu: {e}")
+            devam = input("Yine de kapatılsın mı? (Y/N): ").strip().lower()
+            if devam not in ('y', 'yes', 'evet', 'e'):
+                print("İptal edildi, çalışmaya devam ediliyor.")
+                continue
+
+        print("Program kapatılıyor...")
+        os._exit(0)
+
+
+threading.Thread(target=_stop_dinleyici, daemon=True).start()
 # ==========================================
 # BINANCE NATIVE DATA CLIENT (mainnet, sadece veri -- exec_client YOK)
 # ==========================================

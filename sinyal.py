@@ -121,19 +121,19 @@ def genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp):
     if long_squeeze:
         absorption_riski = cvd_spot > 0 and cvd_spot > abs(cvd_perp)
         if absorption_riski:
-            return "İşlem Açma (Olası Absorption - Spot Alım Baskın)"
+            return "İşlem Açma"
         return "Sağlıklı Short" if cvd_spot < 0 else "Long Squeeze"
 
     if long_trap:
         absorption_riski = cvd_spot > 0 and cvd_spot > abs(cvd_perp)
         if absorption_riski:
-            return "İşlem Açma (Olası Absorption - Spot Alım Baskın)"
+            return "İşlem Açma"
         return "Long Trap"
 
     if short_trap:
         dagitim_riski = cvd_spot < 0 and abs(cvd_spot) > abs(cvd_perp)
         if dagitim_riski:
-            return "İşlem Açma (Olası Dağıtım - Spot Satış Baskın)"
+            return "İşlem Açma"
         return "Short Trap"
 
     # AKÜMÜLASYON / DAĞITIM: fiyat yatay (Nötr) ama OI birikiyor (Artıyor) -> pozisyon
@@ -161,28 +161,19 @@ def _islem_yonu(genel_durum_deger):
         return 'short'
     return None
 
-# TRAP KATEGORİLERİ -- bu ikisi tespit edildiğinde pozisyon HEMEN açılmaz.
-# Long Trap: küçük yatırımcı fiyat yükseldikçe short açıyor, market maker onları
-# sıkıştırarak fiyatı yukarıdaki büyük likidite hedefine kadar sürüklüyor --
-# _islem_yonu bunun için 'short' döner (tuzak TAMAMLANDIKTAN sonraki gerçek
-# yön) ama tuzaklanan/sürüklenen yön aslında 'long' (fiyatın gittiği yön).
-# Short Trap bunun aynası: _islem_yonu 'long' döner, tuzaklanan yön 'short'.
+# TRAP KATEGORİLERİ -- artık ayrı bir bekleme/tersine-hedef fazı yok, bu sözlük
+# sadece telegram.py'nin "hangi kategoriler tuzak" bilgisini bilmesi için duruyor.
+# Long Trap: funding aşırı pozitif (longlar kalabalık/kaldıraçlı), fiyat düşerken
+# OI hâlâ artıyor -- longlar henüz temizlenmedi. _islem_yonu 'short' döner.
+# Short Trap bunun aynası (funding aşırı negatif, fiyat yükselirken OI artıyor).
 TRAP_KATEGORILERI = {"Long Trap": "long", "Short Trap": "short"}
 
-def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, saat_str, kapanis_esigi=3, tp=None,
-                                bekleme_tetik_fiyat=None):
-    """tp: yeni AÇILACAK bir pozisyon için (bekleme tetiklenip pozisyon
-    açıldığında dahil) hedef_belirle(gerçek_yön)'den gelen TP fiyatı.
-
-    bekleme_tetik_fiyat: genel_durum_deger bir TRAP kategorisiyse (Long Trap/
-    Short Trap), hedef_belirle(tuzaklanan_yön)'den gelen tetik noktası --
-    tuzağın TAMAMLANMASI için fiyatın (tuzaklanan yönde) ulaşması beklenen
-    seviye. Trap kategorileri tespit edildiğinde pozisyon hemen açılmaz;
-    aktif_bekleme_{tf}'e kaydedilip bu tetik noktasına ulaşılması beklenir --
-    ulaşıldığında GERÇEK (ters yönlü) pozisyon açılır, TP'si yukarıdaki tp
-    parametresidir. Bekleme süresiz sürer (aynı trap devam ettikçe her turda
-    tetik_fiyat taze veriyle güncellenir); trap sinyali kapanis_esigi kadar
-    art arda farklı bir şeye dönüşürse bekleme iptal edilir."""
+def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, saat_str, kapanis_esigi=3, tp=None):
+    """tp: yeni AÇILACAK bir pozisyon için hedef_belirle(gerçek_yön)'den gelen
+    TP fiyatı -- Trap kategorileri de dahil TÜM kategoriler için doğrudan
+    _islem_yonu'na göre hedef belirlenir, artık ayrı bir bekleme/tersine-hedef
+    fazı yok; tespit edilir edilmez pozisyon hemen açılır, tıpkı diğer
+    kategoriler gibi."""
 
     def aktif_durumu_kaydet(aktif, sayac):
         conn.execute(f"DELETE FROM aktif_islem_{tf} WHERE id=1")
@@ -217,57 +208,10 @@ def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, sa
         )
         return kapanan
 
-    def bekleme_kaydet(genel_durum, tetik_fiyat, sayac):
-        conn.execute(f"DELETE FROM aktif_bekleme_{tf} WHERE id=1")
-        if genel_durum is not None:
-            conn.execute(
-                f"INSERT INTO aktif_bekleme_{tf} (id, genel_durum, tetik_fiyat, farkli_sayac) VALUES (1,?,?,?)",
-                (genel_durum, tetik_fiyat, sayac)
-            )
-
     def yeni_sinyali_islem_baslat_veya_bekle(gd):
-        """Yeni bir sinyal geldiğinde (aktif_islem YOK): trap kategorisiyse
-        bekleme başlatır, değilse doğrudan pozisyon açar."""
-        if gd in TRAP_KATEGORILERI:
-            bekleme_kaydet(gd, bekleme_tetik_fiyat, 0)
-        elif not gd.startswith("İşlem Açma"):
+        if not gd.startswith("İşlem Açma"):
             aktif_durumu_kaydet(yeni_baslat(gd), 0)
 
-    # =========================================================
-    # AŞAMA 1 -- BEKLEME (TRAP) DURUMU VARSA ÖNCE ONU YÖNET
-    # =========================================================
-    bekleme_row = conn.execute(f"SELECT genel_durum, tetik_fiyat, farkli_sayac FROM aktif_bekleme_{tf} WHERE id=1").fetchone()
-    if bekleme_row is not None:
-        bek_genel, bek_tetik, bek_sayac = bekleme_row
-        bek_yon = TRAP_KATEGORILERI.get(bek_genel)  # tuzaklanan/sürüklenen yön
-
-        if genel_durum_deger == bek_genel:
-            # Trap hâlâ (ya da yeniden) doğrulanıyor -- tetik noktasını TAZE
-            # veriyle güncelle ("son gelen sinyalle tekrardan hesaplanır").
-            guncel_tetik = bekleme_tetik_fiyat if bekleme_tetik_fiyat is not None else bek_tetik
-            tetiklendi = (
-                (bek_yon == 'long' and price >= guncel_tetik) or
-                (bek_yon == 'short' and price <= guncel_tetik)
-            )
-            if tetiklendi:
-                bekleme_kaydet(None, None, 0)
-                aktif_durumu_kaydet(yeni_baslat(bek_genel, giris_fiyati=guncel_tetik), 0)
-                return None  # pozisyon yeni açıldı, henüz kapanış yok
-            bekleme_kaydet(bek_genel, guncel_tetik, 0)
-            return None
-        else:
-            bek_sayac += 1
-            if bek_sayac >= kapanis_esigi:
-                bekleme_kaydet(None, None, 0)  # trap iptal oldu, bekleme sona erdi
-                # AŞAĞI DEVAM ET -- aynı turda genel_durum_deger yeni bir
-                # pozisyon (ya da yeni bir bekleme) başlatabilir.
-            else:
-                bekleme_kaydet(bek_genel, bek_tetik, bek_sayac)
-                return None
-
-    # =========================================================
-    # AŞAMA 2 -- NORMAL AÇIK POZİSYON MANTIĞI
-    # =========================================================
     row = conn.execute(
         f"SELECT genel_durum, giris_fiyat, giris_tarih, giris_saat, farkli_sayac, hedef_tp FROM aktif_islem_{tf} WHERE id=1"
     ).fetchone()

@@ -26,15 +26,9 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
     oi_usd = oi * price
     funding = float(funding)
 
-    # ohlc çekilemediyse (None) open/high/low'u close (price) ile dolduruyoruz —
-    # sinyal mantığı zaten sadece 'price' (close) kolonunu kullanıyor, bu satır
-    # sadece likidasyon haritasının ileride bu satırı 'iğnesiz düz mum' gibi
-    # görmesini sağlıyor, mevcut davranışı hiç etkilemiyor.
     if ohlc is None:
         ohlc = {'open': price, 'high': price, 'low': price, 'close': price}
 
-    # oi_linear/oi_inverse verilmediyse (eski çağrı biçimi / test) toplamı linear'a
-    # yazıyoruz — likidasyon.py henüz devrede değilken davranışı bozmamak için.
     if oi_linear is None:
         oi_linear = oi
     if oi_inverse is None:
@@ -62,7 +56,7 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
     fund_status = funding_status(funding)
     arb_durum = arb_risk_durumu(premium_pct)
 
-    conn = sqlite3.connect(path, timeout=30)  # dosya anlık kilitliyse (örn. DB Browser açıksa) 30sn'ye kadar bekler
+    conn = sqlite3.connect(path, timeout=30)
     _init_db(conn)
 
     cur = conn.execute(
@@ -76,16 +70,12 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
     kapanan_islemler = {}
     adaptif = compute_adaptive_tf_thresholds(df_gecmis)
     mevcut_saat, mevcut_dakika = now.hour, now.minute
-    # Aynı turda birden fazla tf aynı yöne (ör. hem 1sa hem 4sa 'long') işaret
-    # edebilir -- hedef_belirle her seferinde DB'yi baştan taradığı için,
-    # yön başına en fazla BİR kez çağırıp sonucu bu turun geri kalanında
-    # tekrar kullanıyoruz (gereksiz tekrar hesaplama/DB okuması yapmamak için).
     hedef_onbellek = {}
 
     for tf, tf_conf in CONFIG['timeframes'].items():
         sinir_saatleri = tf_conf.get('sinir_saatleri')
         if sinir_saatleri is not None and (mevcut_dakika != 0 or mevcut_saat not in sinir_saatleri):
-            continue  # bu tf'in kendi saat sınırı değil, bu turda yazma yapılmıyor
+            continue
 
         tf_adaptif = adaptif.get(tf) if adaptif else None
         oi_esik = tf_adaptif['oi_pct'] if tf_adaptif else tf_conf['oi_pct']
@@ -118,29 +108,13 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
                              'genel_durum': genel, 'telegram_uygun': telegram_uygun}
 
         hedef = None
-        bekleme_tetik_fiyat = None
         if tf != '15dk' and genel != "Veri Bekleniyor":
-            if genel in TRAP_KATEGORILERI:
-                orijinal_yon = TRAP_KATEGORILERI[genel]  # tuzaklanan/sürüklenen yön
-                gercek_yon = _islem_yonu(genel)           # tuzak tamamlanınca açılacak gerçek yön
-
-                if orijinal_yon not in hedef_onbellek:
-                    hedef_onbellek[orijinal_yon] = hedef_belirle(orijinal_yon, db_path=path)
-                bekleme_hedef = hedef_onbellek[orijinal_yon]
-                bekleme_tetik_fiyat = bekleme_hedef['tp'] if bekleme_hedef else None
-                tf_sonuclari[tf]['bekleme_tetik_fiyat'] = bekleme_tetik_fiyat
-
-                if gercek_yon not in hedef_onbellek:
-                    hedef_onbellek[gercek_yon] = hedef_belirle(gercek_yon, db_path=path)
-                hedef = hedef_onbellek[gercek_yon]
+            yon = _islem_yonu(genel)
+            if yon:
+                if yon not in hedef_onbellek:
+                    hedef_onbellek[yon] = hedef_belirle(yon, db_path=path)
+                hedef = hedef_onbellek[yon]
                 tf_sonuclari[tf]['hedef'] = hedef
-            else:
-                yon = _islem_yonu(genel)
-                if yon:
-                    if yon not in hedef_onbellek:
-                        hedef_onbellek[yon] = hedef_belirle(yon, db_path=path)
-                    hedef = hedef_onbellek[yon]
-                    tf_sonuclari[tf]['hedef'] = hedef
 
             # Fiyat, hedefin dayandığı likidite kümesine (hedef_fiyat -- TP'nin
             # kendisi değil, TP'nin türetildiği ham küme fiyatı) ZATEN çok
@@ -154,18 +128,10 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
                 tf_sonuclari[tf]['hedef_mesafe_pct'] = mesafe_pct
                 tf_sonuclari[tf]['hedef_cok_yakin'] = mesafe_pct < 0.5
 
-        # 15dk için AÇIK/KAPALI sinyal takibi (aktif_islem_15dk / sinyal_15dk /
-        # aktif_bekleme_15dk) artık yapılmıyor -- 15dk sadece 1sa'nın
-        # confirm_kaynak'ı olarak (durum_15dk üzerinden) bir KONTROL NOKTASI,
-        # kendi başına izlenen/kapatılan bir sinyal değil.
-        # tp=hedef['tp'] SADECE yeni açılacak bir pozisyon için kullanılır --
-        # zaten açık olan bir pozisyonun TP'si kendi hedef_tp'sinde sabit
-        # kalır (sinyal.py bunu ayrıca garanti ediyor).
         if tf != '15dk' and genel != "Veri Bekleniyor":
             tp = hedef['tp'] if hedef else None
             kapanan = sinyal_performans_guncelle(conn, tf, genel, price, tarih_str, saat_str,
-                                                  tf_conf.get('kapanis_esigi', 3), tp=tp,
-                                                  bekleme_tetik_fiyat=bekleme_tetik_fiyat)
+                                                  tf_conf.get('kapanis_esigi', 3), tp=tp)
             if kapanan:
                 kapanan_islemler[tf] = kapanan
 
@@ -178,16 +144,11 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
         print(f"  Premium (Arb)  : %{premium_pct:+.4f}   ({arb_durum})")
     for tf in CONFIG['timeframes'].keys():
         if tf not in tf_sonuclari:
-            continue  # bu tf'in sınır saati değildi, bu turda yazılmadı
+            continue
         s = tf_sonuclari[tf]
         print(f"  [{tf:>4}] OI:{s['oi_durum']:<16} Fiyat:{s['fiyat_durum']:<12} CVD:{s['cvd_durum']:<10} -> {s['genel_durum']}")
-        if s['genel_durum'] in TRAP_KATEGORILERI and s.get('bekleme_tetik_fiyat'):
-            bekleme_satiri = f"        🪤 Tuzak tespit edildi, HENÜZ POZİSYON AÇILMADI — bekleniyor: ${s['bekleme_tetik_fiyat']:,.2f}"
-            if s.get('hedef'):
-                bekleme_satiri += f"  |  tetiklenince TP: ${s['hedef']['tp']:,.2f}"
-            print(bekleme_satiri)
         hedef = s.get('hedef')
-        if hedef and s['genel_durum'] not in TRAP_KATEGORILERI:
+        if hedef:
             print(f"        🎯 Hedef: ${hedef['hedef_fiyat']:,.2f} ({hedef['hedef_miktar_btc']:,.2f} BTC likidite)  |  TP: ${hedef['tp']:,.2f}")
             if s.get('hedef_cok_yakin'):
                 print(f"        ⚠️ Fiyat hedefe çok yakın (%{s['hedef_mesafe_pct']:.2f} < %0.5) — Telegram'a gönderilmeyecek")
@@ -233,7 +194,6 @@ def print_trend_report(df):
 
 def run_snapshot_and_report():
     baslangic_zamani = datetime.now(timezone(timedelta(hours=3)))
-    # Veri toplama sırasında ayrıntılı borsa loglarını terminal özetinden gizle.
     import contextlib
     import io
     with contextlib.redirect_stdout(io.StringIO()):
@@ -245,8 +205,6 @@ def run_snapshot_and_report():
 
     ohlc = get_btc_ohlc_15m()
     if ohlc is None or ohlc['close'] <= 0:
-        # OHLC çekilemezse anlık fiyata düş (Binance'in kline endpoint'i kısa bir
-        # kesinti yaşarsa turu tamamen atlamak yerine, en azından tek fiyatla devam)
         price = get_btc_price()
         if price <= 0:
             print("  ⏭️  Bu tur ATLANDI (kayıt eklenmedi) — fiyat verisi alınamadı.")
@@ -255,17 +213,12 @@ def run_snapshot_and_report():
     else:
         price = ohlc['close']
 
-    # CVD: bugün UTC 00:00'dan (TR 03:00) itibaren biriken net alım-satım baskısı
     cvd_spot = get_binance_cvd('spot', 'BTCUSDT', interval='1h')
     cvd_perp = get_binance_cvd('futures', 'BTCUSDT', interval='1h')
 
     sonuc = log_snapshot(total_oi, global_funding, price, cvd_spot, cvd_perp, now=baslangic_zamani, ohlc=ohlc,
                           oi_linear=oi_linear, oi_inverse=oi_inverse)
 
-    # Likidasyon haritalarını bu turun yeni yazılan satırıyla birlikte tazele
-    # ve terminale bas -- yönlü bir sinyal olsun olmasın HER 15dk'da bir
-    # çalışır, böylece harita her zaman güncel kalır (hedef_belirle zaten
-    # DB'den taze okuyor, bu sadece görünürlük/log amaçlı).
     try:
         likidasyon_sonucu = tum_haritalari_hesapla()
         buyuk_likidasyonlar = en_buyuk_likidasyonlar(likidasyon_sonucu, guncel_fiyat=price)
@@ -299,10 +252,6 @@ def run_snapshot_and_report():
     return df
 
 def _sonraki_sinira_kadar_bekle(interval_minutes):
-    """Sabit dakika sıfırlarına (örn. 15dk için :00/:15/:30/:45) göre bekler —
-    time.sleep(interval*60) kullanmıyoruz çünkü her turun işlem süresi (API çağrıları
-    vb.) birikip zamanla saatten kaymaya sebep olur. Bu fonksiyon her seferinde
-    GERÇEK saate göre yeniden hesaplar, drift birikmez."""
     simdi = datetime.now(timezone(timedelta(hours=3)))
     gun_baslangic = simdi.replace(hour=0, minute=0, second=0, microsecond=0)
     gecen_dakika = (simdi - gun_baslangic).total_seconds() / 60
@@ -335,7 +284,7 @@ def run_continuous(interval_minutes=15):
             try:
                 send_telegram_message(f"⚠️ <b>Bot hata verdi, bu tur kaydedilemedi:</b>\n{str(e)[:300]}")
             except Exception:
-                pass  # Telegram'ın kendisi de başarısız olursa döngüyü yine de durdurmayalım
+                pass
 
 if __name__ == "__main__":
     run_continuous(15)
