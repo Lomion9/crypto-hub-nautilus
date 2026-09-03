@@ -6,8 +6,8 @@ from datetime import datetime, timedelta, timezone
 from config import CONFIG
 from db import DB_FILE, HISTORY_FILE, VERI_COLS, _init_db, load_history
 from sinyal import (
-    funding_status, _periyot_durumu, cvd_durumu, genel_durum, _islem_yonu,
-    _periyot_cvd_degisimi, compute_adaptive_tf_thresholds,
+    funding_status, _periyot_durumu, _periyot_durumu_fiyat, compute_gecici_oi_esigi,
+    cvd_durumu, genel_durum, _islem_yonu, _periyot_cvd_degisimi,
     son_tf_genel_durumlar, sinyal_performans_guncelle, TRAP_KATEGORILERI,
     arb_risk_durumu,
 )
@@ -34,7 +34,7 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
     if oi_inverse is None:
         oi_inverse = 0.0
 
-    df_gecmis = load_history(path)  # sadece 'veri' tablosu — her tf kendi periyodu kadar geriye bakacak
+    df_gecmis = load_history(path)
 
     row_data = {
         'tarih': now.strftime('%d.%m.%Y'),
@@ -68,7 +68,7 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
 
     tf_sonuclari = {}
     kapanan_islemler = {}
-    adaptif = compute_adaptive_tf_thresholds(df_gecmis)
+    gecici_oi_esigi = compute_gecici_oi_esigi(df_gecmis)
     mevcut_saat, mevcut_dakika = now.hour, now.minute
     hedef_onbellek = {}
 
@@ -77,12 +77,12 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
         if sinir_saatleri is not None and (mevcut_dakika != 0 or mevcut_saat not in sinir_saatleri):
             continue
 
-        tf_adaptif = adaptif.get(tf) if adaptif else None
-        oi_esik = tf_adaptif['oi_pct'] if tf_adaptif else tf_conf['oi_pct']
-        price_esik = tf_adaptif['price_pct'] if tf_adaptif else tf_conf['price_pct']
+        if gecici_oi_esigi is None:
+            oi_durum = "Veri Bekleniyor"
+        else:
+            oi_durum = _periyot_durumu(df_gecmis, oi, tf_conf['periods'], gecici_oi_esigi, 'oi_btc')
 
-        oi_durum = _periyot_durumu(df_gecmis, oi, tf_conf['periods'], oi_esik, 'oi_btc')
-        fiyat_durum = _periyot_durumu(df_gecmis, price, tf_conf['periods'], price_esik, 'price')
+        fiyat_durum = _periyot_durumu_fiyat(df_gecmis, price, tf_conf['periods'])
         cvd_spot_delta, cvd_perp_delta = _periyot_cvd_degisimi(df_gecmis, cvd_spot, cvd_perp, tf_conf['periods'], tarih_str)
 
         if oi_durum == "Veri Bekleniyor" or fiyat_durum == "Veri Bekleniyor" or cvd_spot_delta is None:
@@ -116,13 +116,6 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
                 hedef = hedef_onbellek[yon]
                 tf_sonuclari[tf]['hedef'] = hedef
 
-            # Fiyat, hedefin dayandığı likidite kümesine (hedef_fiyat -- TP'nin
-            # kendisi değil, TP'nin türetildiği ham küme fiyatı) ZATEN çok
-            # yakınsa (< %0.5) sinyal Telegram'a gönderilmiyor -- bu durumda
-            # hedef pratikte "tükenmiş" sayılır (fiyat oraya varmak üzere/vardı
-            # bile), yeni bir sinyal olarak bildirmek yanıltıcı olur. durum_{tf}
-            # tablosuna yazma ve genel akış (kâr/zarar takibi dahil) etkilenmez,
-            # sadece Telegram gönderimi engellenir.
             if hedef:
                 mesafe_pct = abs(hedef['hedef_fiyat'] - price) / price * 100
                 tf_sonuclari[tf]['hedef_mesafe_pct'] = mesafe_pct
@@ -142,6 +135,8 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
     print(f"  Funding Durumu : {fund_status}   |   Gün içi toplam CVD -> Spot:{cvd_spot:+.2f} Perp:{cvd_perp:+.2f}")
     if premium_pct is not None:
         print(f"  Premium (Arb)  : %{premium_pct:+.4f}   ({arb_durum})")
+    if gecici_oi_esigi is not None:
+        print(f"  Geçici OI Eşiği: %{gecici_oi_esigi:.4f}")
     for tf in CONFIG['timeframes'].keys():
         if tf not in tf_sonuclari:
             continue

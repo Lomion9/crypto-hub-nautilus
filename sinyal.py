@@ -43,7 +43,8 @@ def _periyot_durumu(df_veri, mevcut_deger, periods, esik_pct, kolon):
     """ROLLING-MIN / ROLLING-MAX + EŞİK: son N periyotluk pencerenin dip/tepesine
     olan mesafelerden büyük olanı esik_pct'yi geçmiyorsa Nötr döner (akümülasyon/
     dağıtım tespiti Nötr'e ihtiyaç duyar); geçiyorsa hangi mesafe büyükse o yön
-    (Artıyor/Düşüyor) döner."""
+    (Artıyor/Düşüyor) döner. ŞU AN SADECE OI İÇİN KULLANILIYOR (compute_gecici_oi_esigi
+    ile birlikte) -- fiyat için artık _periyot_durumu_fiyat (kırılım bazlı) kullanılıyor."""
     if len(df_veri) < periods:
         return "Veri Bekleniyor"
     pencere = df_veri[kolon].iloc[-periods:]
@@ -59,12 +60,64 @@ def _periyot_durumu(df_veri, mevcut_deger, periods, esik_pct, kolon):
         return "Nötr"
     return "Artıyor" if artis_pct >= dusus_pct else "Düşüyor"
 
+def _periyot_durumu_fiyat(df_veri, mevcut_fiyat, periods):
+    """FİYAT İÇİN SAF KIRILIM MANTIĞI -- yüzde eşiği YOK. 'Önceki mum' (son
+    `periods` adet 15dk barının birleşimi) high/low'una göre: mevcut fiyat
+    önceki mumun high'ının üstüne çıkarsa Artıyor, low'unun altına inerse
+    Düşüyor, ikisinin arasında kalırsa Nötr."""
+    if len(df_veri) < periods:
+        return "Veri Bekleniyor"
+    pencere = df_veri.iloc[-periods:]
+    if pencere['price_high'].isna().any() or pencere['price_low'].isna().any() or not mevcut_fiyat:
+        return "Veri Bekleniyor"
+
+    onceki_high = pencere['price_high'].max()
+    onceki_low = pencere['price_low'].min()
+
+    if mevcut_fiyat > onceki_high:
+        return "Artıyor"
+    elif mevcut_fiyat < onceki_low:
+        return "Düşüyor"
+    return "Nötr"
+
+def compute_gecici_oi_esigi(df_veri):
+    """GEÇİCİ OI eşiği yöntemi (ileride değişecek): en yakın hafta sonu
+    gününün 15dk'lık OI okumaları arasındaki ardışık yüzde değişimlerin
+    MUTLAK toplamı, o günkü veri sayısının 2 katına bölünür. Sonuç, TÜM
+    timeframe'ler için TEK/DÜZ bir eşik olarak kullanılır -- periyot
+    sayısına göre ölçeklenmiyor, bilinçli bir sadeleştirme. Yeterli hafta
+    sonu verisi yoksa None döner."""
+    if 'tarih' not in df_veri.columns or len(df_veri) == 0:
+        return None
+
+    gunler = sorted(df_veri['tarih'].unique(), key=lambda t: datetime.strptime(t, '%d.%m.%Y'))
+    haftasonu_gunler = [g for g in reversed(gunler) if datetime.strptime(g, '%d.%m.%Y').weekday() >= 5]
+
+    for gun in haftasonu_gunler:
+        gun_df = df_veri[df_veri['tarih'] == gun].sort_values('timestamp')
+        oi_degerleri = gun_df['oi_btc'].dropna()
+        oi_degerleri = oi_degerleri[oi_degerleri > 0]
+        n = len(oi_degerleri)
+        if n < 2:
+            continue
+
+        toplam_degisim_pct = 0.0
+        onceki = None
+        for deger in oi_degerleri:
+            if onceki is not None and onceki > 0:
+                toplam_degisim_pct += abs((deger - onceki) / onceki * 100)
+            onceki = deger
+
+        return toplam_degisim_pct / (2 * n)
+
+    return None
+
 def _rolling_hareket_mesafesi(seri, periods):
     """Bir kolon (Series, kronolojik sıralı, POZİSYONEL/0-tabanlı index) için,
     her geçerli noktada 'son N periyotluk pencerenin dip/tepesine olan en büyük
     mesafe' değerini (pozisyon, mesafe) çiftleri olarak döndürür — _periyot_durumu
-    ile BİREBİR aynı ölçütle. Pozisyon bilgisi, güne göre gruplamak (adaptive eşik
-    hesabı) için taşınıyor; eksik/geçersiz noktalar listede hiç yer almaz."""
+    ile BİREBİR aynı ölçütle. compute_adaptive_tf_thresholds (şu an KULLANILMIYOR,
+    bkz. aşağıdaki not) tarafından kullanılıyor."""
     sonuc = []
     for i in range(periods, len(seri)):
         pencere = seri.iloc[i - periods:i]
@@ -112,10 +165,6 @@ def genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp):
     short_squeeze = (fund_negative and oi_status == "Düşüyor" and price_status == "Artıyor")
 
     if short_squeeze:
-        # NOT: eskiden "Sağlıklı Long (Squeeze + Organik Talep)" döndürülüyordu ama
-        # _islem_yonu tam "Sağlıklı Long" arıyordu -> hiç eşleşmiyordu, bu yüzden
-        # "sağlıklı long" hiç tetiklenmiyormuş gibi görünüyordu. Etiketler artık
-        # _islem_yonu ile birebir aynı (parantezli açıklamalar kaldırıldı).
         return "Sağlıklı Long" if cvd_spot > 0 else "Short Squeeze"
 
     if long_squeeze:
@@ -136,20 +185,12 @@ def genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp):
             return "İşlem Açma"
         return "Short Trap"
 
-    # AKÜMÜLASYON / DAĞITIM: fiyat yatay (Nötr) ama OI birikiyor (Artıyor) -> pozisyon
-    # sessizce kuruluyor demektir; yön, hangi tarafın (spot alım mı satım mı) baskın
-    # olduğuna, yani CVD spot'un işaretine ve perp'e göre baskınlığına bakılarak
-    # belirlenir. Bu iki durum funding'in extreme olup olmamasından bağımsızdır --
-    # trap/squeeze koşulları zaten üstte elenmiş olduğu için buraya sadece price_status
-    # Nötr olduğunda düşülür.
     if price_status == "Nötr" and oi_status == "Artıyor":
         if cvd_spot > 0 and cvd_spot >= abs(cvd_perp):
             return "Akümülasyon"
         if cvd_spot < 0 and abs(cvd_spot) >= abs(cvd_perp):
             return "Dağıtım"
 
-    # Fonlama Nötr Pozitif veya Nötr Negatif ise (ya da yukarıdaki hiçbir setup
-    # oluşmadıysa) herhangi bir tasfiye/birikim setup'ı aranmaz
     return "İşlem Açma"
 
 def _islem_yonu(genel_durum_deger):
@@ -161,19 +202,13 @@ def _islem_yonu(genel_durum_deger):
         return 'short'
     return None
 
-# TRAP KATEGORİLERİ -- artık ayrı bir bekleme/tersine-hedef fazı yok, bu sözlük
-# sadece telegram.py'nin "hangi kategoriler tuzak" bilgisini bilmesi için duruyor.
-# Long Trap: funding aşırı pozitif (longlar kalabalık/kaldıraçlı), fiyat düşerken
-# OI hâlâ artıyor -- longlar henüz temizlenmedi. _islem_yonu 'short' döner.
-# Short Trap bunun aynası (funding aşırı negatif, fiyat yükselirken OI artıyor).
 TRAP_KATEGORILERI = {"Long Trap": "long", "Short Trap": "short"}
 
 def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, saat_str, kapanis_esigi=3, tp=None):
     """tp: yeni AÇILACAK bir pozisyon için hedef_belirle(gerçek_yön)'den gelen
     TP fiyatı -- Trap kategorileri de dahil TÜM kategoriler için doğrudan
-    _islem_yonu'na göre hedef belirlenir, artık ayrı bir bekleme/tersine-hedef
-    fazı yok; tespit edilir edilmez pozisyon hemen açılır, tıpkı diğer
-    kategoriler gibi."""
+    _islem_yonu'na göre hedef belirlenir, ayrı bir bekleme/tersine-hedef fazı
+    yok; tespit edilir edilmez pozisyon hemen açılır."""
 
     def aktif_durumu_kaydet(aktif, sayac):
         conn.execute(f"DELETE FROM aktif_islem_{tf} WHERE id=1")
@@ -223,8 +258,6 @@ def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, sa
     aktif = {'genel_durum': row[0], 'giris_fiyat': row[1], 'giris_tarih': row[2], 'giris_saat': row[3], 'hedef_tp': row[5]}
     sayac = row[4]
 
-    # TP KONTROLÜ -- genel_durum hiç değişmemiş olsa bile, fiyat kayıtlı
-    # hedef_tp'ye (pozisyon lehine yönde) ulaştıysa pozisyon HEMEN kapanır.
     aktif_yon = _islem_yonu(aktif['genel_durum'])
     if aktif['hedef_tp'] is not None and aktif_yon is not None:
         hedefe_ulasti = (
@@ -236,7 +269,6 @@ def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, sa
             yeni_sinyali_islem_baslat_veya_bekle(genel_durum_deger)
             return kapanan
 
-    # GENEL_DURUM DEĞİŞİMİ KONTROLÜ (mevcut mantık, aynen korunuyor)
     if genel_durum_deger == aktif['genel_durum']:
         aktif_durumu_kaydet(aktif, 0)
         return None
@@ -253,25 +285,19 @@ def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, sa
 def _periyot_cvd_degisimi(df_veri, current_cvd_spot, current_cvd_perp, periods, tarih_str):
     bugun_df = df_veri[df_veri['tarih'] == tarih_str]
     if bugun_df.empty:
-        return None, None  # bugün henüz hiç kayıt yok
+        return None, None
 
     if len(df_veri) >= periods and df_veri.iloc[-periods]['tarih'] == tarih_str:
         ref = df_veri.iloc[-periods]
     else:
-        ref = bugun_df.iloc[0]  # tam N periyot bugünün dışına taşıyor -> bugünün ilk kaydına düş
+        ref = bugun_df.iloc[0]
 
     return current_cvd_spot - ref['cvd_spot_btc'], current_cvd_perp - ref['cvd_perp_btc']
 
 def compute_adaptive_tf_thresholds(df_veri):
-    """Her timeframe için, son `lookback_days` günün HER BİRİNİN kendi 'gürültü'
-    seviyesini (o gün içindeki, _rolling_hareket_mesafesi ile ölçülen N-periyotluk
-    dip/tepe mesafelerinin `noise_percentile`'ı) ayrı ayrı hesaplar. Bu günlerden
-    EN DÜŞÜK gürültüye sahip `quiet_days` tanesini seçip onların ortalamasını eşik
-    olarak kullanır -- fikir: piyasanın 'sakin' günlerinde tipik hareket ne kadarsa,
-    bunun altında kalan hareketler gürültü/Nötr, üstündekiler gerçek sinyal sayılsın.
-    OI ve fiyat için ayrı ayrı hesaplanır (en sakin 3 gün ikisi için farklı olabilir).
-    Yeterli gün/veri yoksa o tf için None döner; çağıran taraf statik config
-    değerlerine (oi_pct/price_pct) düşer."""
+    """ARTIK ÇAĞRILMIYOR (main.py bunun yerine compute_gecici_oi_esigi +
+    _periyot_durumu_fiyat kullanıyor) -- fonksiyon ileride ihtiyaç olursa
+    diye kod tabanında referans olarak bırakıldı, silinmedi."""
     ac = CONFIG.get('adaptive', {})
     if not ac.get('enabled', True):
         return None
@@ -291,12 +317,10 @@ def compute_adaptive_tf_thresholds(df_veri):
     for tf, tf_conf in CONFIG['timeframes'].items():
         periods = tf_conf['periods']
 
-        # Tüm seri için TEK SEFERDE hesapla; (pozisyon, mesafe) çiftleri güne göre
-        # gruplamak için kullanılacak -- _periyot_durumu'yla birebir aynı ölçüt.
         oi_mesafe_pos = _rolling_hareket_mesafesi(df_veri['oi_btc'], periods)
         price_mesafe_pos = _rolling_hareket_mesafesi(df_veri['price'], periods)
 
-        gun_gurultu = {}  # {gun: {'oi': persentil, 'price': persentil}}
+        gun_gurultu = {}
         for gun in gunler:
             pos_set = set(df_veri.index[df_veri['tarih'] == gun])
 
