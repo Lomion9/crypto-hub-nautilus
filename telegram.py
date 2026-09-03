@@ -11,13 +11,13 @@ _LAST_TELEGRAM_DURUMLAR = {}  # {tf: son gönderilen genel_durum}
 
 def should_send_telegram(tf_sonuclari):
     """tf_sonuclari: {tf: {'genel_durum': ..., 'telegram_uygun': ..., 'hedef_cok_yakin': ..., ...}}.
-    Sadece 1sa/4sa işlenir. Bir timeframe'in genel_durum'u 'İşlem Açma'/'Veri
+    Sadece 2sa/1sa/4sa işlenir. Bir timeframe'in genel_durum'u 'İşlem Açma'/'Veri
     Bekleniyor' DIŞINDA bir şey gösterip kendi son gönderilen durumundan
     FARKLI OLDUĞUNDA VE 'telegram_uygun' VE 'hedef_cok_yakin' DEĞİLSE True döner."""
     global _LAST_TELEGRAM_DURUMLAR
     gonder = False
     for tf, sonuc in tf_sonuclari.items():
-        if tf not in ("1sa", "4sa"):
+        if tf not in ("1sa", "2sa", "4sa"):
             continue
         gd = sonuc['genel_durum']
         onceki = _LAST_TELEGRAM_DURUMLAR.get(tf)
@@ -47,7 +47,7 @@ def send_telegram_message(text, parse_mode="HTML"):
         print(f"  ❌ Telegram gönderim hatası: {e}")
 
 def build_telegram_report(failed_borsalar, total_oi, global_funding, price, cvd_spot, cvd_perp, fund_status, tf_sonuclari, kapanan_islemler, buyuk_likidasyonlar=None, premium_pct=None, arb_risk_durumu=None):
-    """Sadeleştirilmiş rapor: sadece 1sa/4sa, sadece piyasa durumu (genel_durum),
+    """Sadeleştirilmiş rapor: sadece 2sa/1sa/4sa, sadece piyasa durumu (genel_durum),
     yön (long/short) ve TP noktası -- Trap kategorilerinde ise beklenecek tetik
     noktası ve tetiklenince açılacak TP. OI/funding/fiyat/CVD/likidasyon
     haritası/premium artık Telegram'a basılmıyor (konsol çıktısında hâlâ mevcut)."""
@@ -59,7 +59,7 @@ def build_telegram_report(failed_borsalar, total_oi, global_funding, price, cvd_
         lines.append("")
 
     for tf, sonuc in tf_sonuclari.items():
-        if tf not in ("1sa", "4sa"):
+        if tf not in ("1sa", "2sa", "4sa"):
             continue
         genel = sonuc['genel_durum']
         if genel in ("İşlem Açma", "Veri Bekleniyor"):
@@ -85,7 +85,7 @@ def build_telegram_report(failed_borsalar, total_oi, global_funding, price, cvd_
         lines.append("")
         lines.append("💰 <b>KAPANAN SİNYALLER</b>")
         for tf, k in kapanan_islemler.items():
-            if tf not in ("1sa", "4sa"):
+            if tf not in ("1sa", "2sa", "4sa"):
                 continue
             lines.append(f"[{tf}] ({k['kapanis_tipi']}) {k['sinyal']} ({k['yon']}) -> %{k['kar_yuzde']:+.2f}")
 
