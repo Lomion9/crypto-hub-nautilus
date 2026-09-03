@@ -60,23 +60,51 @@ def _periyot_durumu(df_veri, mevcut_deger, periods, esik_pct, kolon):
         return "Nötr"
     return "Artıyor" if artis_pct >= dusus_pct else "Düşüyor"
 
-def _periyot_durumu_fiyat(df_veri, mevcut_fiyat, periods):
-    """FİYAT İÇİN SAF KIRILIM MANTIĞI -- yüzde eşiği YOK. 'Önceki mum' (son
-    `periods` adet 15dk barının birleşimi) high/low'una göre: mevcut fiyat
-    önceki mumun high'ının üstüne çıkarsa Artıyor, low'unun altına inerse
-    Düşüyor, ikisinin arasında kalırsa Nötr."""
-    if len(df_veri) < periods:
+def _periyot_durumu_fiyat(df_veri, mevcut_ohlc, periods):
+    """FİYAT İÇİN MUM-MUM (candle-vs-candle, higher-high/higher-low) KIRILIM
+    MANTIĞI -- eski 'tek nokta vs önceki pencere' testinin yerine geçti.
+    'Mevcut mum' (şu an kapanan `periods` adet 15dk barı: df_veri'nin son
+    periods-1 satırı + mevcut_ohlc'nin kendisi) ile 'önceki mum' (ondan
+    önceki periods adet 15dk barı, tamamen df_veri'den) karşılaştırılır:
+
+      mevcut_low > onceki_low  VE  mevcut_high >= onceki_high  -> Artıyor
+        (dip de yükseldi, tepe de en az korundu -- net yükseliş yapısı)
+      mevcut_high < onceki_high  VE  mevcut_low <= onceki_low  -> Düşüyor
+        (tepe de düştü, dip de en fazla korundu -- net düşüş yapısı)
+      aksi halde (DARALMA: mevcut_low > onceki_low AMA mevcut_high < onceki_high;
+                  ya da GENİŞLEME: mevcut_low < onceki_low VE mevcut_high > onceki_high)
+        -> Nötr (çelişkili/kararsız yapı, tek taraflı kırılım artık yeterli sayılmıyor)
+
+    SABİT MUM (non-overlapping): bu fonksiyon sadece sinir_saatleri sınırlarında
+    çağrılır, iki pencere üst üste binmez -- rolling değil.
+
+    Toplam 2*periods-1 satır geçmiş (df_veri) gerektirir: önceki mum için
+    periods adet, mevcut mumun geçmiş kısmı için periods-1 adet (+1 mevcut_ohlc)."""
+    gerekli = 2 * periods - 1
+    if len(df_veri) < gerekli:
         return "Veri Bekleniyor"
-    pencere = df_veri.iloc[-periods:]
-    if pencere['price_high'].isna().any() or pencere['price_low'].isna().any() or not mevcut_fiyat:
+    if mevcut_ohlc.get('high') is None or mevcut_ohlc.get('low') is None:
         return "Veri Bekleniyor"
 
-    onceki_high = pencere['price_high'].max()
-    onceki_low = pencere['price_low'].min()
+    if periods > 1:
+        mevcut_gecmis = df_veri.iloc[-(periods - 1):]
+        onceki_pencere = df_veri.iloc[-gerekli:-(periods - 1)]
+    else:
+        mevcut_gecmis = df_veri.iloc[0:0]  # boş -- mevcut mum sadece mevcut_ohlc'nin kendisi
+        onceki_pencere = df_veri.iloc[-periods:]
 
-    if mevcut_fiyat > onceki_high:
+    if mevcut_gecmis['price_high'].isna().any() or mevcut_gecmis['price_low'].isna().any() \
+       or onceki_pencere['price_high'].isna().any() or onceki_pencere['price_low'].isna().any():
+        return "Veri Bekleniyor"
+
+    mevcut_high = max(mevcut_gecmis['price_high'].max(), mevcut_ohlc['high']) if periods > 1 else mevcut_ohlc['high']
+    mevcut_low = min(mevcut_gecmis['price_low'].min(), mevcut_ohlc['low']) if periods > 1 else mevcut_ohlc['low']
+    onceki_high = onceki_pencere['price_high'].max()
+    onceki_low = onceki_pencere['price_low'].min()
+
+    if mevcut_low > onceki_low and mevcut_high >= onceki_high:
         return "Artıyor"
-    elif mevcut_fiyat < onceki_low:
+    elif mevcut_high < onceki_high and mevcut_low <= onceki_low:
         return "Düşüyor"
     return "Nötr"
 

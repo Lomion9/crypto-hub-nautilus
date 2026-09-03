@@ -90,7 +90,7 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
         else:
             oi_durum = _periyot_durumu_oi(df_gecmis, oi, tf_conf['periods'])
 
-        fiyat_durum = _periyot_durumu_fiyat(df_gecmis, price, tf_conf['periods'])
+        fiyat_durum = _periyot_durumu_fiyat(df_gecmis, ohlc, tf_conf['periods'])
         cvd_spot_delta, cvd_perp_delta = _periyot_cvd_degisimi(df_gecmis, cvd_spot, cvd_perp, tf_conf['periods'], tarih_str)
 
         if oi_durum == "Veri Bekleniyor" or fiyat_durum == "Veri Bekleniyor" or cvd_spot_delta is None:
