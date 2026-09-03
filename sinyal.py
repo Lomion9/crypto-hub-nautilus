@@ -80,6 +80,34 @@ def _periyot_durumu_fiyat(df_veri, mevcut_fiyat, periods):
         return "Düşüyor"
     return "Nötr"
 
+def _periyot_durumu_oi(df_veri, mevcut_deger, periods):
+    """OI İÇİN AYNI SAF KIRILIM MANTIĞI -- _periyot_durumu_fiyat ile birebir
+    simetrik. OI'de gerçek intra-periyot high/low yok (her 15dk'lık satır
+    borsalardan çekilen TEK bir REST anlık görüntüsü) -- bu yüzden 'önceki
+    mum'un high/low'u, son `periods` adet 15dk'lık OI NOKTA ÖRNEĞİNİN
+    kendisinin min/max'ı olarak kuruluyor (yani N tane nokta, bir mumun
+    içindeki N tane tick gibi ele alınıyor). Mevcut OI bu aralığın üstüne
+    çıkarsa Artıyor, altına inerse Düşüyor, arada kalırsa Nötr. SADECE
+    15dk'DAN BÜYÜK timeframe'ler için kullanılır -- 15dk'da periods=1
+    olduğundan 'önceki mum' tek bir noktaya iner (high=low=o nokta), bu da
+    testi anlamsızlaştırır (her fark Artıyor/Düşüyor sayılır, Nötr hiç
+    çıkmaz); 15dk hâlâ compute_gecici_oi_esigi + _periyot_durumu (%-eşikli)
+    kullanmaya devam ediyor."""
+    if len(df_veri) < periods:
+        return "Veri Bekleniyor"
+    pencere = df_veri['oi_btc'].iloc[-periods:]
+    if pencere.isna().any() or (pencere <= 0).any() or not mevcut_deger:
+        return "Veri Bekleniyor"
+
+    onceki_high = pencere.max()
+    onceki_low = pencere.min()
+
+    if mevcut_deger > onceki_high:
+        return "Artıyor"
+    elif mevcut_deger < onceki_low:
+        return "Düşüyor"
+    return "Nötr"
+
 def compute_gecici_oi_esigi(df_veri):
     """GEÇİCİ OI eşiği yöntemi (ileride değişecek): en yakın hafta sonu
     gününün 15dk'lık OI okumaları arasındaki ardışık yüzde değişimlerin

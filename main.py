@@ -6,8 +6,8 @@ from datetime import datetime, timedelta, timezone
 from config import CONFIG
 from db import DB_FILE, HISTORY_FILE, VERI_COLS, _init_db, load_history
 from sinyal import (
-    funding_status, _periyot_durumu, _periyot_durumu_fiyat, compute_gecici_oi_esigi,
-    cvd_durumu, genel_durum, _islem_yonu, _periyot_cvd_degisimi,
+    funding_status, _periyot_durumu, _periyot_durumu_fiyat, _periyot_durumu_oi,
+    compute_gecici_oi_esigi, cvd_durumu, genel_durum, _islem_yonu, _periyot_cvd_degisimi,
     son_tf_genel_durumlar, sinyal_performans_guncelle, TRAP_KATEGORILERI,
     arb_risk_durumu,
 )
@@ -77,10 +77,18 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
         if sinir_saatleri is not None and (mevcut_dakika != 0 or mevcut_saat not in sinir_saatleri):
             continue
 
-        if gecici_oi_esigi is None:
-            oi_durum = "Veri Bekleniyor"
+        # 15dk'da 'önceki mum' tek noktaya indiği için kırılım testi anlamsız
+        # kalıyor (periods=1) -- bu yüzden 15dk hâlâ %-eşikli yöntemi (compute_gecici_oi_esigi
+        # + _periyot_durumu) kullanıyor. 1sa ve üzeri, fiyattaki kırılım mantığıyla
+        # simetrik olan _periyot_durumu_oi'ye geçti -- bkz. sinyal.py'deki not:
+        # düz %-eşik uzun timeframe'lerde Nötr'ü neredeyse hiç üretmiyordu.
+        if tf == '15dk':
+            if gecici_oi_esigi is None:
+                oi_durum = "Veri Bekleniyor"
+            else:
+                oi_durum = _periyot_durumu(df_gecmis, oi, tf_conf['periods'], gecici_oi_esigi, 'oi_btc')
         else:
-            oi_durum = _periyot_durumu(df_gecmis, oi, tf_conf['periods'], gecici_oi_esigi, 'oi_btc')
+            oi_durum = _periyot_durumu_oi(df_gecmis, oi, tf_conf['periods'])
 
         fiyat_durum = _periyot_durumu_fiyat(df_gecmis, price, tf_conf['periods'])
         cvd_spot_delta, cvd_perp_delta = _periyot_cvd_degisimi(df_gecmis, cvd_spot, cvd_perp, tf_conf['periods'], tarih_str)
