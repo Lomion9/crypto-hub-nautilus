@@ -32,3 +32,16 @@ export function signedClass(value: number | null | undefined): string {
   if (value == null || value === 0) return "text-zinc-300";
   return value > 0 ? "text-up" : "text-down";
 }
+
+export function localIsoDate(date = new Date()): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+export function localIsoDaysAgo(days: number): string {
+  const date = new Date();
+  date.setDate(date.getDate() - days);
+  return localIsoDate(date);
+}

@@ -4,7 +4,9 @@ import { NavLink } from "react-router-dom";
 const links = [
   { to: "/", label: "Dashboard" },
   { to: "/charts", label: "Grafik" },
-  { to: "/setup", label: "Ayarlar" },
+  { to: "/liquidations", label: "Likidasyon" },
+  { to: "/history", label: "Geçmiş" },
+  { to: "/settings", label: "Ayarlar" },
 ];
 
 export default function Layout({ children }: { children: ReactNode }) {

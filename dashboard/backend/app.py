@@ -10,11 +10,17 @@ from database import (
     SETTING_TELEGRAM_CHAT_ID,
     SETTING_TELEGRAM_TOKEN,
     TIMEFRAMES,
+    fetch_closed_signals,
+    fetch_history_series,
     fetch_latest_veri,
+    fetch_realized_liquidations,
     get_settings,
+    parse_iso_date,
     telegram_configured,
     upsert_settings,
 )
+from history import signal_stats
+from liquidity import serialize_estimated_map
 from overview import build_overview
 
 app = FastAPI(title="CryptoHub Dashboard API", version="0.1.0")
@@ -57,6 +63,54 @@ def overview():
     if data is None:
         raise HTTPException(status_code=404, detail="veri table is empty")
     return data
+
+
+@app.get("/api/liquidation-map")
+def liquidation_map(layer: str = "linear", window: int = 12):
+    if layer not in ("linear", "inverse"):
+        raise HTTPException(status_code=400, detail="layer must be linear or inverse")
+    if window not in (12, 24):
+        raise HTTPException(status_code=400, detail="window must be 12 or 24")
+    try:
+        latest = fetch_latest_veri()
+        price = float(latest["price"]) if latest and latest.get("price") is not None else None
+        return serialize_estimated_map(layer, window, price)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Liquidation map failed: {exc}") from exc
+
+
+@app.get("/api/liquidations")
+def liquidations(start: str | None = None, end: str | None = None):
+    try:
+        start_d = parse_iso_date(start)
+        end_d = parse_iso_date(end)
+        return {"events": fetch_realized_liquidations(start_d, end_d)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Liquidations failed: {exc}") from exc
+
+
+@app.get("/api/history")
+def history(start: str | None = None, end: str | None = None):
+    try:
+        start_d = parse_iso_date(start)
+        end_d = parse_iso_date(end)
+        if start_d and end_d and start_d > end_d:
+            raise ValueError("start after end")
+        series = fetch_history_series(start_d, end_d)
+        signals = fetch_closed_signals(start_d, end_d)
+        return {"series": series, "signals": signals, "stats": signal_stats(signals)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"History failed: {exc}") from exc
 
 
 @app.get("/api/candles")

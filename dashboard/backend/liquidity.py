@@ -15,6 +15,45 @@ _CACHE_AT = 0.0
 _CACHE_TTL_SEC = 30.0
 
 
+def get_harita(*, force: bool = False) -> dict:
+    global _CACHE, _CACHE_AT
+    now = time.monotonic()
+    if force or _CACHE is None or now - _CACHE_AT > _CACHE_TTL_SEC:
+        from likidasyon import tum_haritalari_hesapla
+
+        _CACHE = tum_haritalari_hesapla()
+        _CACHE_AT = now
+    return _CACHE
+
+
+def serialize_estimated_map(layer: str, window_h: int, current_price: float | None) -> dict:
+    harita = get_harita()
+    katmanlar = harita.get("katmanlar") or {}
+    pencereler = katmanlar.get(layer) or {}
+    kumeler = pencereler.get(window_h) or pencereler.get(int(window_h)) or {}
+    levels = []
+    for anahtar, miktar in (kumeler or {}).items():
+        fiyat, yon = anahtar
+        levels.append(
+            {
+                "price": float(fiyat),
+                "side": str(yon),
+                "amount_btc": float(miktar),
+            }
+        )
+    levels.sort(key=lambda item: item["price"])
+    guncel_oi = {}
+    for key, value in (harita.get("guncel_oi") or {}).items():
+        guncel_oi[key] = float(value) if value is not None else None
+    return {
+        "layer": layer,
+        "window_h": int(window_h),
+        "current_price": current_price,
+        "guncel_oi": guncel_oi,
+        "levels": levels,
+    }
+
+
 def _flatten_clusters(harita: dict) -> list[dict]:
     rows: list[dict] = []
     katmanlar = harita.get("katmanlar") or {}
@@ -36,17 +75,9 @@ def _flatten_clusters(harita: dict) -> list[dict]:
 
 def nearest_liquidity_levels(current_price: float | None) -> dict:
     """Closest cluster above and below the current price (12h linear+inverse combined)."""
-    global _CACHE, _CACHE_AT
-    now = time.monotonic()
-    if _CACHE is None or now - _CACHE_AT > _CACHE_TTL_SEC:
-        from likidasyon import tum_haritalari_hesapla
-
-        _CACHE = tum_haritalari_hesapla()
-        _CACHE_AT = now
-
     clusters = [
         c
-        for c in _flatten_clusters(_CACHE)
+        for c in _flatten_clusters(get_harita())
         if c["window_h"] == 12
     ]
     merged: dict[tuple[float, str], float] = {}

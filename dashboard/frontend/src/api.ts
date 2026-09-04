@@ -120,3 +120,99 @@ export async function fetchCandles(tf: Timeframe): Promise<CandlesPayload> {
   }
   return res.json();
 }
+
+export type LiqLevel = {
+  price: number;
+  side: string;
+  amount_btc: number;
+};
+
+export type EstimatedMap = {
+  layer: string;
+  window_h: number;
+  current_price: number | null;
+  guncel_oi: { linear?: number | null; inverse?: number | null };
+  levels: LiqLevel[];
+};
+
+export async function fetchLiquidationMap(
+  layer: "linear" | "inverse",
+  window: 12 | 24,
+): Promise<EstimatedMap> {
+  const res = await fetch(`/api/liquidation-map?layer=${layer}&window=${window}`);
+  if (!res.ok) {
+    throw new Error("Likidasyon haritası okunamadı");
+  }
+  return res.json();
+}
+
+export type RealizedLiq = {
+  id: number;
+  tarih: string;
+  saat: string;
+  yon: string;
+  kontrat_tipi: string;
+  gercek_fiyat: number;
+  notional_usd: number;
+  tahmini_kume_fiyat: number | null;
+  tahmini_katman: string | null;
+  tahmini_pencere: number | null;
+  fark_usd: number | null;
+  fark_yuzde: number | null;
+  time: number | null;
+};
+
+export async function fetchRealizedLiquidations(start: string, end: string): Promise<{ events: RealizedLiq[] }> {
+  const params = new URLSearchParams({ start, end });
+  const res = await fetch(`/api/liquidations?${params}`);
+  if (!res.ok) {
+    throw new Error("Gerçekleşen likidasyonlar okunamadı");
+  }
+  return res.json();
+}
+
+export type HistoryPoint = {
+  time: number;
+  oi_btc: number | null;
+  funding_pct: number | null;
+  cvd_spot_btc: number | null;
+  cvd_perp_btc: number | null;
+  price: number | null;
+};
+
+export type ClosedSignal = {
+  tf: string;
+  kapanis_tarih: string;
+  kapanis_saat: string;
+  sinyal: string;
+  yon: string;
+  giris_tarih: string;
+  giris_saat: string;
+  giris_fiyat: number;
+  cikis_fiyat: number;
+  kar_yuzde: number | null;
+  kapanis_tipi: string | null;
+};
+
+export type HistoryPayload = {
+  series: HistoryPoint[];
+  signals: ClosedSignal[];
+  stats: {
+    count: number;
+    wins: number;
+    losses: number;
+    flats: number;
+    avg_pct: number | null;
+    win_rate: number | null;
+    by_tf: Record<string, { count: number; wins: number; losses: number; avg_pct: number | null; win_rate: number | null }>;
+  };
+};
+
+export async function fetchHistory(start: string, end: string): Promise<HistoryPayload> {
+  const params = new URLSearchParams({ start, end });
+  const res = await fetch(`/api/history?${params}`);
+  if (!res.ok) {
+    throw new Error("Geçmiş verisi okunamadı");
+  }
+  return res.json();
+}

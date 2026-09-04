@@ -1,4 +1,6 @@
 import os
+import sqlite3
+
 import requests
 
 # ==========================================
@@ -6,6 +8,33 @@ import requests
 # ==========================================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+
+def _telegram_from_settings():
+    try:
+        from db import DB_FILE
+
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            rows = conn.execute(
+                "SELECT key, value FROM settings WHERE key IN (?, ?)",
+                ("telegram_bot_token", "telegram_chat_id"),
+            ).fetchall()
+        finally:
+            conn.close()
+        data = {key: (value or "").strip() for key, value in rows}
+        return data.get("telegram_bot_token", ""), data.get("telegram_chat_id", "")
+    except Exception:
+        return "", ""
+
+
+def _telegram_credentials():
+    token, chat_id = _telegram_from_settings()
+    if not token:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "") or TELEGRAM_BOT_TOKEN
+    if not chat_id:
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID", "") or TELEGRAM_CHAT_ID
+    return token, chat_id
 
 _LAST_TELEGRAM_DURUMLAR = {}  # {tf: son gönderilen genel_durum}
 
@@ -27,13 +56,14 @@ def should_send_telegram(tf_sonuclari):
     return gonder
 
 def send_telegram_message(text, parse_mode="HTML"):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    token, chat_id = _telegram_credentials()
+    if not token or not chat_id:
         print("  ⚠️ TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID tanımlı değil, mesaj gönderilmedi.")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         resp = requests.post(url, data={
-            "chat_id": TELEGRAM_CHAT_ID,
+            "chat_id": chat_id,
             "text": text,
             "parse_mode": parse_mode
         }, timeout=10)

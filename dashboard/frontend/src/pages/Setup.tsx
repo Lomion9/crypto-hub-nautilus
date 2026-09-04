@@ -5,9 +5,15 @@ type Props = {
   initialToken?: string;
   initialChatId?: string;
   onSaved: () => void;
+  embedded?: boolean;
 };
 
-export default function Setup({ initialToken = "", initialChatId = "", onSaved }: Props) {
+export default function Setup({
+  initialToken = "",
+  initialChatId = "",
+  onSaved,
+  embedded = false,
+}: Props) {
   const [token, setToken] = useState(initialToken);
   const [chatId, setChatId] = useState(initialChatId);
   const [error, setError] = useState("");
@@ -31,15 +37,19 @@ export default function Setup({ initialToken = "", initialChatId = "", onSaved }
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center px-4">
+    <div className={embedded ? "" : "flex min-h-screen items-center justify-center px-4"}>
       <form
         onSubmit={onSubmit}
-        className="w-full max-w-md rounded-xl border border-zinc-800 bg-zinc-950/80 p-8 shadow-xl"
+        className={`w-full max-w-md rounded-xl border border-zinc-800 bg-zinc-950/80 p-8 shadow-xl ${
+          embedded ? "mx-0" : ""
+        }`}
       >
         <p className="mb-1 text-xs font-medium tracking-[0.2em] text-zinc-500 uppercase">
           CryptoHub
         </p>
-        <h1 className="mb-2 text-xl font-semibold text-zinc-100">Kurulum</h1>
+        <h1 className="mb-2 text-xl font-semibold text-zinc-100">
+          {embedded ? "Telegram" : "Kurulum"}
+        </h1>
         <p className="mb-6 text-sm text-zinc-400">
           Telegram bildirimleri için bot token ve chat ID girin. Bu bilgiler
           veritabanındaki settings tablosuna kaydedilir.
@@ -73,7 +83,7 @@ export default function Setup({ initialToken = "", initialChatId = "", onSaved }
           disabled={saving}
           className="w-full rounded-lg bg-zinc-100 px-4 py-2 text-sm font-medium text-zinc-950 disabled:opacity-50"
         >
-          {saving ? "Kaydediliyor..." : "Kaydet ve devam et"}
+          {saving ? "Kaydediliyor..." : embedded ? "Kaydet" : "Kaydet ve devam et"}
         </button>
       </form>
     </div>
