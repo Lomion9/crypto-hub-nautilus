@@ -300,7 +300,9 @@ def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, sa
         return kapanan
 
     def yeni_sinyali_islem_baslat_veya_bekle(gd):
-        if not gd.startswith("İşlem Açma"):
+        if gd.startswith("İşlem Açma"):
+            aktif_durumu_kaydet(None, 0)  # hayalet pozisyonu tamamen temizle
+        else:
             aktif_durumu_kaydet(yeni_baslat(gd), 0)
 
     row = conn.execute(
