@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 nautilus-env/
 .vscode/
+dashboard/frontend/node_modules/
+dashboard/frontend/dist/

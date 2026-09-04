@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from candles import build_candles
+from database import (
+    DB_PATH,
+    SETTING_TELEGRAM_CHAT_ID,
+    SETTING_TELEGRAM_TOKEN,
+    TIMEFRAMES,
+    fetch_latest_veri,
+    get_settings,
+    telegram_configured,
+    upsert_settings,
+)
+from overview import build_overview
+
+app = FastAPI(title="CryptoHub Dashboard API", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/api/health")
+def health():
+    return {"ok": True, "db": str(DB_PATH), "db_exists": DB_PATH.exists()}
+
+
+@app.get("/api/latest")
+def latest():
+    try:
+        row = fetch_latest_veri()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Database read failed: {exc}") from exc
+    if row is None:
+        raise HTTPException(status_code=404, detail="veri table is empty")
+    return row
+
+
+@app.get("/api/overview")
+def overview():
+    try:
+        data = build_overview()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Overview failed: {exc}") from exc
+    if data is None:
+        raise HTTPException(status_code=404, detail="veri table is empty")
+    return data
+
+
+@app.get("/api/candles")
+def candles(tf: str = "15dk"):
+    if tf not in TIMEFRAMES:
+        raise HTTPException(status_code=400, detail=f"Unknown timeframe: {tf}")
+    try:
+        return build_candles(tf)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Candles failed: {exc}") from exc
+
+
+class TelegramSettingsIn(BaseModel):
+    telegram_bot_token: str = Field(min_length=1)
+    telegram_chat_id: str = Field(min_length=1)
+
+
+def _settings_payload(data: dict[str, str]) -> dict:
+    return {
+        "telegram_bot_token": data.get(SETTING_TELEGRAM_TOKEN, ""),
+        "telegram_chat_id": data.get(SETTING_TELEGRAM_CHAT_ID, ""),
+        "configured": telegram_configured(data),
+    }
+
+
+@app.get("/api/settings")
+def read_settings():
+    try:
+        data = get_settings()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Settings read failed: {exc}") from exc
+    return _settings_payload(data)
+
+
+@app.put("/api/settings")
+def write_settings(body: TelegramSettingsIn):
+    try:
+        data = upsert_settings(
+            {
+                SETTING_TELEGRAM_TOKEN: body.telegram_bot_token.strip(),
+                SETTING_TELEGRAM_CHAT_ID: body.telegram_chat_id.strip(),
+            }
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Settings write failed: {exc}") from exc
+    return _settings_payload(data)
