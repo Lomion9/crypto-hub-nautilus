@@ -209,45 +209,48 @@ def cvd_durumu(cvd_spot, cvd_perp):
     return f"Spot {spot_yon} / Perp {perp_yon} ({etiket})"
 
 def genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp):
+    """İkili döner: (genel_durum_string, trap_etiketi). trap_etiketi SADECE
+    loglama/görüntüleme içindir -- genel_durum_string'e karıştırılmıyor
+    (arb_risk_durumu ile aynı prensip). Trap koşulları ARTIK POZİSYON
+    AÇTIRMIYOR (genel_durum_string hep "İşlem Açma" döner) -- Trap, Squeeze'in
+    henüz gerçekleşmemiş ön hazırlık fazı: OI hâlâ artıyor demek, kalabalık
+    taraf henüz temizlenmedi. Gerçek pozisyon, OI düşmeye BAŞLADIĞINDA
+    (Squeeze) açılır."""
     fund_positive = (fund_status == "Aşırı Pozitif")
     fund_negative = (fund_status == "Aşırı Negatif")
 
-    # Long taraf: funding Aşırı Pozitif -> longlar baskın/kaldıraçlı
     long_trap = (fund_positive and oi_status == "Artıyor" and price_status == "Düşüyor")
     long_squeeze = (fund_positive and oi_status == "Düşüyor" and price_status == "Düşüyor")
 
-    # Short taraf: funding Aşırı Negatif -> shortlar baskın/kaldıraçlı (long tarafın aynası)
     short_trap = (fund_negative and oi_status == "Artıyor" and price_status == "Artıyor")
     short_squeeze = (fund_negative and oi_status == "Düşüyor" and price_status == "Artıyor")
 
     if short_squeeze:
-        return "Sağlıklı Long" if cvd_spot > 0 else "Short Squeeze"
+        return ("Sağlıklı Long" if cvd_spot > 0 else "Short Squeeze"), None
 
     if long_squeeze:
         absorption_riski = cvd_spot > 0 and cvd_spot > abs(cvd_perp)
         if absorption_riski:
-            return "İşlem Açma"
-        return "Sağlıklı Short" if cvd_spot < 0 else "Long Squeeze"
+            return "İşlem Açma", None
+        return ("Sağlıklı Short" if cvd_spot < 0 else "Long Squeeze"), None
 
     if long_trap:
         absorption_riski = cvd_spot > 0 and cvd_spot > abs(cvd_perp)
-        if absorption_riski:
-            return "İşlem Açma"
-        return "Long Trap"
+        etiket = "Long Trap (Olası Absorption)" if absorption_riski else "Long Trap"
+        return "İşlem Açma", etiket
 
     if short_trap:
         dagitim_riski = cvd_spot < 0 and abs(cvd_spot) > abs(cvd_perp)
-        if dagitim_riski:
-            return "İşlem Açma"
-        return "Short Trap"
+        etiket = "Short Trap (Olası Dağıtım)" if dagitim_riski else "Short Trap"
+        return "İşlem Açma", etiket
 
     if price_status == "Nötr" and oi_status == "Artıyor":
         if cvd_spot > 0 and cvd_spot >= abs(cvd_perp):
-            return "Akümülasyon"
+            return "Akümülasyon", None
         if cvd_spot < 0 and abs(cvd_spot) >= abs(cvd_perp):
-            return "Dağıtım"
+            return "Dağıtım", None
 
-    return "İşlem Açma"
+    return "İşlem Açma", None
 
 def _islem_yonu(genel_durum_deger):
     long_sinyaller = {"Sağlıklı Long", "Short Squeeze", "Short Trap", "Akümülasyon"}

@@ -77,11 +77,6 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
         if sinir_saatleri is not None and (mevcut_dakika != 0 or mevcut_saat not in sinir_saatleri):
             continue
 
-        # 15dk'da 'önceki mum' tek noktaya indiği için kırılım testi anlamsız
-        # kalıyor (periods=1) -- bu yüzden 15dk hâlâ %-eşikli yöntemi (compute_gecici_oi_esigi
-        # + _periyot_durumu) kullanıyor. 1sa ve üzeri, fiyattaki kırılım mantığıyla
-        # simetrik olan _periyot_durumu_oi'ye geçti -- bkz. sinyal.py'deki not:
-        # düz %-eşik uzun timeframe'lerde Nötr'ü neredeyse hiç üretmiyordu.
         if tf == '15dk':
             if gecici_oi_esigi is None:
                 oi_durum = "Veri Bekleniyor"
@@ -96,13 +91,14 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
         if oi_durum == "Veri Bekleniyor" or fiyat_durum == "Veri Bekleniyor" or cvd_spot_delta is None:
             genel = "Veri Bekleniyor"
             cvd_durum_tf = "Veri Bekleniyor"
+            trap_etiketi = None
         else:
             cvd_durum_tf = cvd_durumu(cvd_spot_delta, cvd_perp_delta)
-            genel = genel_durum(fund_status, oi_durum, fiyat_durum, cvd_spot_delta, cvd_perp_delta)
+            genel, trap_etiketi = genel_durum(fund_status, oi_durum, fiyat_durum, cvd_spot_delta, cvd_perp_delta)
 
         conn.execute(
-            f"INSERT INTO durum_{tf} (id, tarih, saat, funding_durum, oi_durum, fiyat_durum, cvd_durum, genel_durum) VALUES (?,?,?,?,?,?,?,?)",
-            (yeni_id, tarih_str, saat_str, fund_status, oi_durum, fiyat_durum, cvd_durum_tf, genel)
+            f"INSERT INTO durum_{tf} (id, tarih, saat, funding_durum, oi_durum, fiyat_durum, cvd_durum, genel_durum, trap_etiketi) VALUES (?,?,?,?,?,?,?,?,?)",
+            (yeni_id, tarih_str, saat_str, fund_status, oi_durum, fiyat_durum, cvd_durum_tf, genel, trap_etiketi)
         )
 
         if tf == '15dk':
@@ -113,7 +109,7 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
             telegram_uygun = True
 
         tf_sonuclari[tf] = {'oi_durum': oi_durum, 'fiyat_durum': fiyat_durum, 'cvd_durum': cvd_durum_tf,
-                             'genel_durum': genel, 'telegram_uygun': telegram_uygun}
+                             'genel_durum': genel, 'trap_etiketi': trap_etiketi, 'telegram_uygun': telegram_uygun}
 
         hedef = None
         if tf != '15dk' and genel != "Veri Bekleniyor":
@@ -150,6 +146,8 @@ def log_snapshot(oi, funding, price, cvd_spot, cvd_perp, path=HISTORY_FILE, now=
             continue
         s = tf_sonuclari[tf]
         print(f"  [{tf:>4}] OI:{s['oi_durum']:<16} Fiyat:{s['fiyat_durum']:<12} CVD:{s['cvd_durum']:<10} -> {s['genel_durum']}")
+        if s.get('trap_etiketi'):
+            print(f"        🪤 {s['trap_etiketi']} (henüz pozisyon açılmadı, Squeeze bekleniyor)")
         hedef = s.get('hedef')
         if hedef:
             print(f"        🎯 Hedef: ${hedef['hedef_fiyat']:,.2f} ({hedef['hedef_miktar_btc']:,.2f} BTC likidite)  |  TP: ${hedef['tp']:,.2f}")
