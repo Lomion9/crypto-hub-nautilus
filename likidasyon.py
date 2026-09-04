@@ -1,13 +1,6 @@
 # ==========================================
 # LİKİDASYON HARİTASI
 # ==========================================
-# Yöntem özeti: Coinglass'ınkine benzer, sabit-pencereli kümülatif-delta model.
-# Linear (USDT) ve inverse (USD/coin-margined) OI ayrı katman olarak tutulur
-# (teminat matematiği farklı). Fiyat serisi Binance'in 15dk OHLC'si -- sadece
-# close değil, High/Low de kullanılıyor (fiyat bir seviyeye değip geri çekilse
-# bile o seviyedeki kümeleri temizlemek için). OI verisi db.py üzerinden
-# mevcut oi_funding_history.db'den okunur; bu script sadece okur, main.py hâlâ
-# tek yazan taraf ve main.py'den tamamen ayrı çalışır (kendi zamanlaması).
 
 from config import CONFIG
 import pandas as pd
@@ -16,13 +9,6 @@ import pandas as pd
 # 1a) KALDIRAÇ DAĞILIMI (funding'e göre dinamik)
 # ==========================================
 def kaldirac_dagilimi(funding_pct):
-    """Taban ağırlıktan (config.likidasyon.kaldirac_taban_agirlik) başlar, funding
-    ne kadar ekstremse (funding_thresholds.extreme_pct eşiğine oranla) düşük
-    kaldıraçtan (5x, 10x) yüksek kaldıraca (50x, 100x) o kadar ağırlık kaydırır.
-    25x sabit kalır -- düşük ve yüksek uçlar arasında bir 'menteşe' gibi davranır.
-    Kayma miktarı siddet_tavan_kati'nin ötesinde artmaya devam etmez (tavan var).
-    Dönen sözlüğün ağırlıkları toplamı her zaman 1.0 olarak korunur (sadece
-    düşükten yükseğe kayıyor, toplamdan bir şey kaybolmuyor/eklenmiyor)."""
     lc = CONFIG['likidasyon']
     taban = {int(k): v for k, v in lc['kaldirac_taban_agirlik'].items()}
     extreme_esik = CONFIG['funding_thresholds']['extreme_pct']
@@ -57,14 +43,6 @@ def kaldirac_dagilimi(funding_pct):
 # 1b) TEK BİR OI DELTA'SINI FİYAT KÜMELERİNE ÇEVİRME
 # ==========================================
 def cvd_agirlikli_long_payi(cvd_perp_delta, oi_delta_abs):
-    """Bir periyottaki OI artışının (oi_delta_abs, BTC) ne kadarının long, ne
-    kadarının short pozisyon olduğunu, o periyottaki perp CVD değişiminin
-    (cvd_perp_delta -- net taker alım/satım baskısı) büyüklüğüne göre tahmin
-    eder. CVD'yi (spot değil) PERP tercih ediyoruz çünkü OI değişimi zaten
-    perp/futures piyasasında oluyor, oradaki taker baskısı en doğrudan sinyal.
-    cvd_perp_delta OI artışına kıyasla ne kadar büyükse, o kadar tek yöne
-    (0.0=tamamen short, 1.0=tamamen long) yaklaşır; delta yoksa (oi_delta_abs<=0)
-    ya da CVD nötrse 0.5 (yarı yarıya) döner."""
     if oi_delta_abs <= 0:
         return 0.5
     oran = cvd_perp_delta / (abs(cvd_perp_delta) + oi_delta_abs)  # -1..1 arası
@@ -72,15 +50,6 @@ def cvd_agirlikli_long_payi(cvd_perp_delta, oi_delta_abs):
     return max(0.0, min(1.0, long_payi))
 
 def delta_kumeleri_hesapla(delta_oi, acilis_fiyati, cvd_perp_delta, funding_pct):
-    """Bir periyotta artan OI'yi (delta_oi, BTC), o anki fiyattan (acilis_fiyati)
-    açılmış varsayılan pozisyonlar olarak modelleyip fiyat kümelerine dönüştürür:
-      1) cvd_agirlikli_long_payi ile long/short'a böler,
-      2) kaldirac_dagilimi ile her kaldıraç seviyesine dağıtır,
-      3) isolated marj formülüyle (bakım marjı config'den) her seviyenin
-         likidasyon fiyatını hesaplar.
-    delta_oi <= 0 ise (OI artışı yoksa, bu fonksiyon sadece ARTIŞLARI işler,
-    azalışlar ayrı bir adımda -- 1e -- ele alınacak) boş sözlük döner.
-    Dönüş: {(likidasyon_fiyati, 'long'|'short'): miktar_btc, ...}"""
     if delta_oi <= 0:
         return {}
 
@@ -94,11 +63,6 @@ def delta_kumeleri_hesapla(delta_oi, acilis_fiyati, cvd_perp_delta, funding_pct)
     kumeler = {}
     for kaldirac, agirlik in dagilim.items():
         bm = bakim_marji[kaldirac]
-        # GÜVENLİK PAYI: bm, 1/kaldıraç'ın (başlangıç marjı) en fazla %90'ı kadar
-        # olabilir -- bm >= 1/kaldıraç olursa likidasyon fiyatı giriş fiyatının
-        # YANLIŞ tarafına geçer (long'un likidasyonu girişin üstüne, short'unki
-        # altına düşer -- fiziksel olarak imkansız). config.json yanlış/aşırı bir
-        # değerle güncellense bile bu satır formülü her zaman doğru tarafta tutar.
         bm_guvenli = min(bm, (1 / kaldirac) * 0.9)
 
         if long_miktar > 0:
@@ -119,12 +83,6 @@ def delta_kumeleri_hesapla(delta_oi, acilis_fiyati, cvd_perp_delta, funding_pct)
 # 1d) OHLC (HIGH/LOW) İLE TEMİZLEME
 # ==========================================
 def _kumeleri_temizle(kumeler, price_low, price_high):
-    """Bir mumun [price_low, price_high] aralığına giren TÜM kümeleri (long ya da
-    short farketmeksizin) siler -- fiyat o seviyeye gerçekten değmiş demektir,
-    oradaki tahmini pozisyonlar likide olmuş sayılır. kumeler sözlüğü YERİNDE
-    (in-place) değiştirilir. Silinen bir seviye, pencerede daha sonra yeni bir
-    delta ile tekrar dolabilir -- bu fonksiyon sadece o ana kadar birikmiş
-    kümeleri temizler, gelecekteki eklemeleri engellemez."""
     silinecekler = [anahtar for anahtar in kumeler if price_low <= anahtar[0] <= price_high]
     for anahtar in silinecekler:
         del kumeler[anahtar]
@@ -133,15 +91,6 @@ def _kumeleri_temizle(kumeler, price_low, price_high):
 # 1e) OI AZALIŞINI ORANTILI YANSITMA
 # ==========================================
 def _kumeleri_oransal_kucult(kumeler, kucultme_orani):
-    """OI bir periyotta azaldığında (kucultme_orani = azalış_miktarı / önceki_OI,
-    0..1 arası), hangi spesifik kümenin kapandığını bilemediğimiz için TÜM aktif
-    kümeleri aynı yüzdeyle küçültür -- keyfi bir seçim yapmaktan (ör. sadece en
-    yeni kümeyi silmek) kaçınan en basit/tarafsız yaklaşım. kucultme_orani 1.0'ı
-    geçerse (aşırı durum, OI önceki değerinden daha fazla azalmış görünüyorsa)
-    1.0'a sabitlenir -- negatif miktar üretilmez. kumeler sözlüğü YERİNDE
-    değiştirilir; 0'a inen kümeler sözlükte kalır (0 miktarlı), sonraki bir
-    delta ile tekrar dolabilirler -- gerçek silme sadece _kumeleri_temizle'de
-    (fiyatın seviyeye değmesiyle) olur."""
     oran = min(max(kucultme_orani, 0.0), 1.0)
     if oran <= 0:
         return
@@ -155,24 +104,6 @@ def _kumeleri_oransal_kucult(kumeler, kucultme_orani):
 from datetime import timedelta
 
 def pencere_kumeleri_biriktir(df, saat_penceresi, oi_kolonu='oi_linear_btc', temizleme_aktif=True):
-    """db.load_history() çıktısını (kronolojik sıralı, index 0..n-1) alır, son
-    `saat_penceresi` saatlik pencere içindeki ARDIŞIK satırlar arasındaki
-    oi_kolonu artışlarını delta_kumeleri_hesapla ile fiyat kümelerine çevirip
-    TEK BİR sözlükte toplar. Henüz OI azalışını işleme (1e) yok.
-
-    Her satırda ÖNCE o satırın price_low/price_high'ı önceki (daha eski)
-    kümeleri temizler (mum içinde fiyat önce hareket edip eski seviyeleri
-    süpürür), SONRA o satırın kendi delta'sı yeni küme olarak eklenir (kapanışta
-    yeni pozisyon açılır). temizleme_aktif=False verilirse 1c'deki ham
-    davranışa (hiç temizleme yapmadan) döner -- 1c'nin eski testleriyle
-    karşılaştırma/regresyon amaçlı.
-
-    Pencerenin İLK satırının delta'sını hesaplayabilmek için, pencere
-    başlangıcından hemen önceki satırı da (kendisi bir 'yeni pozisyon' olarak
-    işlenmeden, sadece referans/'anchor' olarak) kullanır -- yoksa pencerenin
-    ilk anındaki OI, sanki sıfırdan başlıyormuş gibi yanlış yorumlanır.
-
-    Dönüş: {(likidasyon_fiyati, 'long'|'short'): miktar_btc, ...}"""
     if df.empty or len(df) < 2:
         return {}
 
@@ -199,11 +130,6 @@ def pencere_kumeleri_biriktir(df, saat_penceresi, oi_kolonu='oi_linear_btc', tem
         oi_once = onceki[oi_kolonu]
 
         if pd.isna(oi_simdi) or pd.isna(oi_once):
-            # Bu satır ya da bir öncekinde bu katmanın OI'si henüz loglanmamış
-            # (ör. borsa.py bu değişiklikten önce yazılmış eski bir satır) --
-            # delta hesaplanamaz, bu adımı atla ama zinciri kırma (onceki'yi
-            # yine de güncelle ki bir sonraki geçerli satırdan itibaren devam
-            # edebilsin).
             onceki = satir
             continue
 
@@ -237,9 +163,6 @@ KATMANLAR = {
 PENCERELER = (12, 24)  # saat
 
 def format_usd_kisaltma(deger):
-    """Dolar değerini okunaklı kısaltmayla döndürür -- 1 milyar+ için 2 ondalık
-    ve 'B' (ör. '22.74B'), 1 milyon+ için 1 ondalık ve 'M' (ör. '24.2M'),
-    1 bin+ için 1 ondalık ve 'K', altında ise tam sayı formatında."""
     deger = abs(deger)
     if deger >= 1_000_000_000:
         return f"{deger/1_000_000_000:.2f}B"
@@ -250,21 +173,6 @@ def format_usd_kisaltma(deger):
     return f"{deger:,.0f}"
 
 def tum_haritalari_hesapla(db_path=None):
-    """Tüm katman × pencere kombinasyonlarını (linear/inverse × 12s/24s = 4 harita)
-    tek çağrıda hesaplar. db.py'den geçmişi okur (main.py'nin yazdığı canlı
-    veri), her kombinasyon için pencere_kumeleri_biriktir'i çağırır.
-
-    Dönüş: {
-      'katmanlar': {
-        'linear':  {12: {(fiyat, yon): miktar, ...}, 24: {...}},
-        'inverse': {12: {...}, 24: {...}},
-      },
-      'guncel_oi': {'linear': <şu anki linear OI, BTC>, 'inverse': <şu anki inverse OI, BTC>},
-    }
-    Yeterli veri yoksa (ör. oi_linear/inverse_btc kolonları henüz boşsa, ya da
-    pencere kadar geçmiş birikmemişse) ilgili harita boş sözlük olarak döner --
-    hata fırlatmaz, çağıran taraf (sinyal hedefleme ileride) boş haritayı
-    'bu pencerede veri yok' olarak yorumlayabilir."""
     from db import load_history, DB_FILE
     df = load_history(db_path or DB_FILE)
 
@@ -285,12 +193,6 @@ def tum_haritalari_hesapla(db_path=None):
     return {'katmanlar': katmanlar, 'guncel_oi': guncel_oi}
 
 def harita_ozeti_yazdir(sonuc, guncel_fiyat=None):
-    """tum_haritalari_hesapla çıktısını terminale okunaklı özet olarak basar --
-    her katman için şu anki toplam OI'yi (BTC + $ kısaltmalı), sonra her
-    katman/pencere için küme sayısı, toplam miktar (BTC + $ kısaltmalı) ve
-    (varsa) en büyük 3 kümeyi (BTC + $ kısaltmalı) gösterir. guncel_fiyat
-    verilmezse $ dönüşümleri ve mesafe (%) bilgisi atlanır. Hızlı gözle
-    kontrol / main.py'ye entegrasyon öncesi debug amaçlı."""
     katmanlar = sonuc['katmanlar']
     guncel_oi = sonuc.get('guncel_oi', {})
 
@@ -317,7 +219,6 @@ def harita_ozeti_yazdir(sonuc, guncel_fiyat=None):
                 print(f"      {yon:<6} ${fiyat:>10,.2f}{mesafe}  {miktar_gosterim}")
 
 def en_buyuk_likidasyonlar(sonuc, guncel_fiyat=None):
-    """Tüm katman ve pencereler içinden en büyük long/short kümeleri döndürür."""
     en_buyuk = {'long': None, 'short': None}
     for katman_adi, pencereler in sonuc.get('katmanlar', {}).items():
         for saat, kumeler in pencereler.items():
@@ -343,20 +244,6 @@ def en_buyuk_likidasyonlar(sonuc, guncel_fiyat=None):
 # SİNYALE HEDEF VERME
 # ==========================================
 def hedef_belirle(yon, tp_tampon=200, saat_penceresi=12, db_path=None):
-    """Bir sinyalin yönüne ('long' ya da 'short') göre, o yönün KARŞITI olan
-    likidasyon kümelerinden (long sinyalse ÜSTTEKİ short kümeleri, short sinyalse
-    ALTTAKİ long kümeleri -- fiyat o yöne gidince karşı taraf sıkışıp fiyatı o
-    seviyeye çeker) en büyüğünü bulup hedef ve take-profit üretir.
-
-    Linear ve inverse katmanları BİRLEŞTİRİLİR (aynı fiyat+yön'e denk gelen
-    miktarlar toplanır) -- kullanıcı bu ayrımı hedef belirlerken önemsemiyor,
-    tek bir havuzdan en büyük kümeye bakılıyor. Sadece {saat_penceresi} saatlik
-    pencere kullanılır (24s'e düşme YOK -- 12s'te pratikte her zaman en az bir
-    küme bulunur, bulunamaması istisnai bir durum sayılır).
-
-    Dönüş: {'hedef_fiyat': ..., 'hedef_miktar_btc': ..., 'tp': ...,
-    'yon': yon} ya da (12s penceresinde hiç karşıt küme yoksa, istisnai durum)
-    None."""
     from db import load_history, DB_FILE
     df = load_history(db_path or DB_FILE)
 

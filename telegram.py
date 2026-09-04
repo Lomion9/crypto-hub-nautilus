@@ -10,10 +10,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 _LAST_TELEGRAM_DURUMLAR = {}  # {tf: son gönderilen genel_durum}
 
 def should_send_telegram(tf_sonuclari):
-    """tf_sonuclari: {tf: {'genel_durum': ..., 'telegram_uygun': ..., 'hedef_cok_yakin': ..., ...}}.
-    Sadece 2sa/1sa/4sa işlenir. Bir timeframe'in genel_durum'u 'İşlem Açma'/'Veri
-    Bekleniyor' DIŞINDA bir şey gösterip kendi son gönderilen durumundan
-    FARKLI OLDUĞUNDA VE 'telegram_uygun' VE 'hedef_cok_yakin' DEĞİLSE True döner."""
     global _LAST_TELEGRAM_DURUMLAR
     gonder = False
     for tf, sonuc in tf_sonuclari.items():
@@ -47,10 +43,6 @@ def send_telegram_message(text, parse_mode="HTML"):
         print(f"  ❌ Telegram gönderim hatası: {e}")
 
 def build_telegram_report(failed_borsalar, total_oi, global_funding, price, cvd_spot, cvd_perp, fund_status, tf_sonuclari, kapanan_islemler, buyuk_likidasyonlar=None, premium_pct=None, arb_risk_durumu=None):
-    """Sadeleştirilmiş rapor: sadece 2sa/1sa/4sa, sadece piyasa durumu (genel_durum),
-    yön (long/short) ve TP noktası -- Trap kategorilerinde ise beklenecek tetik
-    noktası ve tetiklenince açılacak TP. OI/funding/fiyat/CVD/likidasyon
-    haritası/premium artık Telegram'a basılmıyor (konsol çıktısında hâlâ mevcut)."""
     from sinyal import TRAP_KATEGORILERI, _islem_yonu
 
     lines = []

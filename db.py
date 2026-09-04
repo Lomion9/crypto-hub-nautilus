@@ -42,9 +42,6 @@ def _migrate_add_trap_etiketi(conn, tf):
         conn.execute(f"ALTER TABLE durum_{tf} ADD COLUMN trap_etiketi TEXT")
 
 def _init_gercek_likidasyon_tablosu(conn):
-    """Binance'in !forceOrder@arr stream'inden gelen GERÇEK likidasyon
-    event'lerini, o anki tahmini likidasyon haritasıyla kıyaslayıp kalıcı
-    olarak saklar -- kaldirac_taban_agirlik'in gelecekteki kalibrasyonu için."""
     conn.execute("""CREATE TABLE IF NOT EXISTS gercek_likidasyon (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tarih TEXT, saat TEXT,
@@ -74,8 +71,6 @@ def gercek_likidasyon_kaydet(conn, yon, kontrat_tipi, gercek_fiyat, notional_usd
     conn.commit()
 
 def _init_db(conn):
-    """veri tablosu + her timeframe için ayrı durum/sinyal/aktif-işlem/bekleme
-    dörtlüsü oluşturur. durum_{tf}.id, veri.id ile BİREBİR aynı değeri kullanır."""
     conn.execute('''CREATE TABLE IF NOT EXISTS veri (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tarih TEXT, saat TEXT, oi_btc REAL, oi_usd REAL, funding_pct REAL,

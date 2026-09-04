@@ -2,9 +2,6 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# CWD'den bağımsız: .env dosyasını her zaman run.py ile AYNI klasörden yükler.
-# load_dotenv() parametresiz çağrılırsa çalışma dizinine (script'i nereden
-# çalıştırdığına) bakar -- IDE/farklı klasörden çalıştırınca sessizce bulamaz.
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from nautilus_trader.config import (
@@ -65,13 +62,6 @@ def _stop_dinleyici():
 
 
 threading.Thread(target=_stop_dinleyici, daemon=True).start()
-# ==========================================
-# BINANCE NATIVE DATA CLIENT (mainnet, sadece veri -- exec_client YOK)
-# ==========================================
-# api_key/api_secret verilmezse SDK otomatik BINANCE_API_KEY / BINANCE_API_SECRET
-# env değişkenlerine bakar. Public market data (bar/trade tick/order book) için
-# API key şart değil, ama Binance'in rate-limit/instrument-provider akışı için
-# önerilir -- ortam değişkeni olarak tanımlamak yeterli, koda hardcode etme.
 binance_data_config = BinanceDataClientConfig(
     api_key=None,   # env: BINANCE_API_KEY
     api_secret=None,  # env: BINANCE_API_SECRET

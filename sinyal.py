@@ -21,15 +21,6 @@ def funding_status(current_funding):
     return "Nötr"
 
 def arb_risk_durumu(premium_pct):
-    """Binance perp mark price'ının spot endeksten sapma yüzdesine (premium_pct,
-    bkz. borsa.get_binance_premium_index) göre bir arb-riski etiketi döndürür.
-    BİLİNÇLİ TASARIM: bu, genel_durum()'un döndürdüğü stringe KARIŞTIRILMIYOR --
-    o string _islem_yonu, should_send_telegram (dedup), DB karşılaştırmaları
-    gibi birçok yerde BİREBİR eşleşmeyle kullanılıyor; içine yeni bir etiket
-    eklemek (ör. sonuna ' ⚠️ Arb Riski' eklemek) o eşleşmeleri sessizce kırar.
-    Bunun yerine ayrı, paralel bir bilgi olarak (log_snapshot'ın döndürdüğü
-    sonuc sözlüğünde ayrı bir alan olarak) taşınıyor.
-    premium_pct None ise (bu tur çekilemediyse) "Veri Yok" döner."""
     if premium_pct is None:
         return "Veri Yok"
     esik = CONFIG.get('premium_thresholds', {}).get('extreme_pct', 0.10)
@@ -40,11 +31,6 @@ def arb_risk_durumu(premium_pct):
     return "Normal"
 
 def _periyot_durumu(df_veri, mevcut_deger, periods, esik_pct, kolon):
-    """ROLLING-MIN / ROLLING-MAX + EŞİK: son N periyotluk pencerenin dip/tepesine
-    olan mesafelerden büyük olanı esik_pct'yi geçmiyorsa Nötr döner (akümülasyon/
-    dağıtım tespiti Nötr'e ihtiyaç duyar); geçiyorsa hangi mesafe büyükse o yön
-    (Artıyor/Düşüyor) döner. ŞU AN SADECE OI İÇİN KULLANILIYOR (compute_gecici_oi_esigi
-    ile birlikte) -- fiyat için artık _periyot_durumu_fiyat (kırılım bazlı) kullanılıyor."""
     if len(df_veri) < periods:
         return "Veri Bekleniyor"
     pencere = df_veri[kolon].iloc[-periods:]
@@ -60,26 +46,7 @@ def _periyot_durumu(df_veri, mevcut_deger, periods, esik_pct, kolon):
         return "Nötr"
     return "Artıyor" if artis_pct >= dusus_pct else "Düşüyor"
 
-def _periyot_durumu_fiyat(df_veri, mevcut_ohlc, periods):
-    """FİYAT İÇİN MUM-MUM (candle-vs-candle, higher-high/higher-low) KIRILIM
-    MANTIĞI -- eski 'tek nokta vs önceki pencere' testinin yerine geçti.
-    'Mevcut mum' (şu an kapanan `periods` adet 15dk barı: df_veri'nin son
-    periods-1 satırı + mevcut_ohlc'nin kendisi) ile 'önceki mum' (ondan
-    önceki periods adet 15dk barı, tamamen df_veri'den) karşılaştırılır:
-
-      mevcut_low > onceki_low  VE  mevcut_high >= onceki_high  -> Artıyor
-        (dip de yükseldi, tepe de en az korundu -- net yükseliş yapısı)
-      mevcut_high < onceki_high  VE  mevcut_low <= onceki_low  -> Düşüyor
-        (tepe de düştü, dip de en fazla korundu -- net düşüş yapısı)
-      aksi halde (DARALMA: mevcut_low > onceki_low AMA mevcut_high < onceki_high;
-                  ya da GENİŞLEME: mevcut_low < onceki_low VE mevcut_high > onceki_high)
-        -> Nötr (çelişkili/kararsız yapı, tek taraflı kırılım artık yeterli sayılmıyor)
-
-    SABİT MUM (non-overlapping): bu fonksiyon sadece sinir_saatleri sınırlarında
-    çağrılır, iki pencere üst üste binmez -- rolling değil.
-
-    Toplam 2*periods-1 satır geçmiş (df_veri) gerektirir: önceki mum için
-    periods adet, mevcut mumun geçmiş kısmı için periods-1 adet (+1 mevcut_ohlc)."""
+def _periyot_durumu_fiyat(df_veri, mevcut_ohlc, periods):  
     gerekli = 2 * periods - 1
     if len(df_veri) < gerekli:
         return "Veri Bekleniyor"
@@ -109,18 +76,6 @@ def _periyot_durumu_fiyat(df_veri, mevcut_ohlc, periods):
     return "Nötr"
 
 def _periyot_durumu_oi(df_veri, mevcut_deger, periods):
-    """OI İÇİN AYNI SAF KIRILIM MANTIĞI -- _periyot_durumu_fiyat ile birebir
-    simetrik. OI'de gerçek intra-periyot high/low yok (her 15dk'lık satır
-    borsalardan çekilen TEK bir REST anlık görüntüsü) -- bu yüzden 'önceki
-    mum'un high/low'u, son `periods` adet 15dk'lık OI NOKTA ÖRNEĞİNİN
-    kendisinin min/max'ı olarak kuruluyor (yani N tane nokta, bir mumun
-    içindeki N tane tick gibi ele alınıyor). Mevcut OI bu aralığın üstüne
-    çıkarsa Artıyor, altına inerse Düşüyor, arada kalırsa Nötr. SADECE
-    15dk'DAN BÜYÜK timeframe'ler için kullanılır -- 15dk'da periods=1
-    olduğundan 'önceki mum' tek bir noktaya iner (high=low=o nokta), bu da
-    testi anlamsızlaştırır (her fark Artıyor/Düşüyor sayılır, Nötr hiç
-    çıkmaz); 15dk hâlâ compute_gecici_oi_esigi + _periyot_durumu (%-eşikli)
-    kullanmaya devam ediyor."""
     if len(df_veri) < periods:
         return "Veri Bekleniyor"
     pencere = df_veri['oi_btc'].iloc[-periods:]
@@ -137,12 +92,6 @@ def _periyot_durumu_oi(df_veri, mevcut_deger, periods):
     return "Nötr"
 
 def compute_gecici_oi_esigi(df_veri):
-    """GEÇİCİ OI eşiği yöntemi (ileride değişecek): en yakın hafta sonu
-    gününün 15dk'lık OI okumaları arasındaki ardışık yüzde değişimlerin
-    MUTLAK toplamı, o günkü veri sayısının 2 katına bölünür. Sonuç, TÜM
-    timeframe'ler için TEK/DÜZ bir eşik olarak kullanılır -- periyot
-    sayısına göre ölçeklenmiyor, bilinçli bir sadeleştirme. Yeterli hafta
-    sonu verisi yoksa None döner."""
     if 'tarih' not in df_veri.columns or len(df_veri) == 0:
         return None
 
@@ -169,11 +118,6 @@ def compute_gecici_oi_esigi(df_veri):
     return None
 
 def _rolling_hareket_mesafesi(seri, periods):
-    """Bir kolon (Series, kronolojik sıralı, POZİSYONEL/0-tabanlı index) için,
-    her geçerli noktada 'son N periyotluk pencerenin dip/tepesine olan en büyük
-    mesafe' değerini (pozisyon, mesafe) çiftleri olarak döndürür — _periyot_durumu
-    ile BİREBİR aynı ölçütle. compute_adaptive_tf_thresholds (şu an KULLANILMIYOR,
-    bkz. aşağıdaki not) tarafından kullanılıyor."""
     sonuc = []
     for i in range(periods, len(seri)):
         pencere = seri.iloc[i - periods:i]
@@ -187,9 +131,6 @@ def _rolling_hareket_mesafesi(seri, periods):
     return sonuc
 
 def son_tf_genel_durumlar(conn, kaynak_tf, n):
-    """Şu ana kadar (bu turda kaynak_tf için yeni bir kayıt yazıldıysa o da dahil —
-    aynı bağlantıda commit beklemeden görünür) yazılmış son n adet
-    durum_{kaynak_tf}.genel_durum değerini, en yeniden en eskiye döndürür."""
     rows = conn.execute(
         f"SELECT genel_durum FROM durum_{kaynak_tf} ORDER BY id DESC LIMIT ?", (n,)
     ).fetchall()
@@ -209,13 +150,6 @@ def cvd_durumu(cvd_spot, cvd_perp):
     return f"Spot {spot_yon} / Perp {perp_yon} ({etiket})"
 
 def genel_durum(fund_status, oi_status, price_status, cvd_spot, cvd_perp):
-    """İkili döner: (genel_durum_string, trap_etiketi). trap_etiketi SADECE
-    loglama/görüntüleme içindir -- genel_durum_string'e karıştırılmıyor
-    (arb_risk_durumu ile aynı prensip). Trap koşulları ARTIK POZİSYON
-    AÇTIRMIYOR (genel_durum_string hep "İşlem Açma" döner) -- Trap, Squeeze'in
-    henüz gerçekleşmemiş ön hazırlık fazı: OI hâlâ artıyor demek, kalabalık
-    taraf henüz temizlenmedi. Gerçek pozisyon, OI düşmeye BAŞLADIĞINDA
-    (Squeeze) açılır."""
     fund_positive = (fund_status == "Aşırı Pozitif")
     fund_negative = (fund_status == "Aşırı Negatif")
 
@@ -264,10 +198,6 @@ def _islem_yonu(genel_durum_deger):
 TRAP_KATEGORILERI = {"Long Trap": "long", "Short Trap": "short"}
 
 def sinyal_performans_guncelle(conn, tf, genel_durum_deger, price, tarih_str, saat_str, kapanis_esigi=3, tp=None):
-    """tp: yeni AÇILACAK bir pozisyon için hedef_belirle(gerçek_yön)'den gelen
-    TP fiyatı -- Trap kategorileri de dahil TÜM kategoriler için doğrudan
-    _islem_yonu'na göre hedef belirlenir, ayrı bir bekleme/tersine-hedef fazı
-    yok; tespit edilir edilmez pozisyon hemen açılır."""
 
     def aktif_durumu_kaydet(aktif, sayac):
         conn.execute(f"DELETE FROM aktif_islem_{tf} WHERE id=1")
@@ -356,9 +286,6 @@ def _periyot_cvd_degisimi(df_veri, current_cvd_spot, current_cvd_perp, periods, 
     return current_cvd_spot - ref['cvd_spot_btc'], current_cvd_perp - ref['cvd_perp_btc']
 
 def compute_adaptive_tf_thresholds(df_veri):
-    """ARTIK ÇAĞRILMIYOR (main.py bunun yerine compute_gecici_oi_esigi +
-    _periyot_durumu_fiyat kullanıyor) -- fonksiyon ileride ihtiyaç olursa
-    diye kod tabanında referans olarak bırakıldı, silinmedi."""
     ac = CONFIG.get('adaptive', {})
     if not ac.get('enabled', True):
         return None

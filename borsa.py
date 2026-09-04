@@ -6,10 +6,6 @@ from datetime import datetime, timezone
 from config import CONFIG
 
 def _usd_kisaltma(deger):
-    """Dolar değerini okunaklı kısaltmayla döndürür -- likidasyon.py'deki
-    format_usd_kisaltma ile aynı mantık, döngüsel import olmaması için burada
-    ayrıca (küçük olduğu için) tutuluyor. 1 milyar+ -> 'B', 1 milyon+ -> 'M',
-    1 bin+ -> 'K'."""
     deger = abs(deger)
     if deger >= 1_000_000_000:
         return f"{deger/1_000_000_000:.2f}B"
@@ -160,16 +156,6 @@ def get_binance_cvd(market_type='spot', symbol='BTCUSDT', interval='1h'):
         return 0.0
 
 def get_okx_spot_cvd(ccy='BTC'):
-    """OKX'in ayrı istatistik endpoint'inden (rubik/stat/taker-volume) SPOT
-    piyasası için bugünkü (UTC 00:00'dan itibaren) kümülatif CVD'yi hesaplar.
-    Binance'in kline'ının aksine OKX'in normal mum verisinde taker alım/satım
-    ayrımı YOK -- bu yüzden ayrı bir istatistik endpoint'i kullanılıyor.
-    SADECE SPOT: bu endpoint'in 'CONTRACTS' (perp/futures) modu muhtemelen
-    kontrat sayısı cinsinden dönüyor (BTC değil), doğru çevirmek için OKX'in
-    kontrat çarpanını (ctVal) ayrıca sorgulamak gerekir -- bu canlı doğrulanana
-    kadar eklenmedi (bkz. sohbet notu). SPOT modu ise doğrudan BTC (taban
-    varlık) cinsinden olduğu için Binance'in spot CVD'siyle güvenle toplanabilir.
-    period='1H' kullanılıyor (Binance'teki interval='1h' ile aynı mantık)."""
     try:
         now_utc = datetime.now(timezone.utc)
         day_start_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -198,12 +184,6 @@ def get_okx_spot_cvd(ccy='BTC'):
         return 0.0
 
 def get_toplam_cvd(market_type='spot', symbol='BTCUSDT', okx_ccy='BTC'):
-    """Binance + (varsa) OKX spot CVD'sini toplar. market_type='spot' ise
-    Binance spot + OKX spot (ikisi de BTC cinsinden, güvenle toplanabilir).
-    market_type='futures' ise SADECE Binance futures döner -- OKX'in contracts
-    (perp) CVD'si birim doğrulaması yapılmadan eklenmedi (bkz. get_okx_spot_cvd
-    docstring'i). OKX çağrısı başarısız olursa (0.0 dönerse) sessizce sadece
-    Binance'in değeriyle devam eder, tüm satırı iptal etmez."""
     binance_cvd = get_binance_cvd(market_type=market_type, symbol=symbol)
     if market_type == 'spot':
         okx_cvd = get_okx_spot_cvd(ccy=okx_ccy)
@@ -211,10 +191,6 @@ def get_toplam_cvd(market_type='spot', symbol='BTCUSDT', okx_ccy='BTC'):
     return binance_cvd
 
 def fetch_with_retry(fetch_func, *args, retries=2, delay=3, **kwargs):
-    """Bir borsa çağrısı geçici bir hatadan (network blip, rate limit, borsanın
-    anlık kesintisi vb.) dolayı 0 dönerse, tüm satırı 'başarısız' loglamadan önce
-    birkaç kez daha dener. Kalıcı bir sorun varsa (borsa gerçekten çökmüşse)
-    yine de son denemeden sonra 0,0 döner ve failed_borsalar listesine düşer."""
     oi, funding = 0, 0
     for attempt in range(retries + 1):
         oi, funding = fetch_func(*args, **kwargs)
@@ -231,15 +207,6 @@ def get_btc_price():
     except: return 0.0
 
 def get_binance_premium_index(symbol='BTCUSDT'):
-    """Binance USDT-M vadeli işlemler premiumIndex endpoint'inden mark price
-    ile index price (spot endeks) arasındaki farkı (premium, yüzde) döndürür.
-    Normalde funding mekanizması bunu küçük tutar; anormal büyümesi (borsalar
-    arası arbitraj kanallarının tıkanması, ani likidite krizi vb.) bir
-    'arb riski' sinyali olarak okunabilir -- bkz. sinyal.arb_risk_durumu.
-    Dönüş: {'mark_price', 'index_price', 'premium_pct'} ya da hata/geçersiz
-    veri durumunda None (çağıran taraf None'ı 'bu tur premium verisi yok'
-    olarak yorumlamalı, tüm snapshot'u iptal etmemeli -- OI/funding/fiyat gibi
-    kritik değil, ek/tamamlayıcı bir gösterge)."""
     try:
         r = requests.get(
             "https://fapi.binance.com/fapi/v1/premiumIndex",
@@ -257,12 +224,6 @@ def get_binance_premium_index(symbol='BTCUSDT'):
         return None
 
 def get_btc_ohlc_15m():
-    """Binance'ten en son kapanmış 15dk'lık mumu (open, high, low, close) çeker.
-    Likidasyon haritasının fiyatın bir seviyeye iğne atıp geri çekilmesini
-    ('temizleme') görebilmesi için tek bir anlık fiyat yetmiyor — mumun
-    high/low'u lazım. limit=2 çekip SON KAPANMIŞ mumu (ohlcv[-2]) kullanıyoruz;
-    ohlcv[-1] hâlâ oluşmakta olan/tamamlanmamış mum olurdu, onun high/low'u
-    henüz kesinleşmemiş olur."""
     try:
         r = requests.get(
             "https://api.binance.com/api/v3/klines",
@@ -288,10 +249,6 @@ def get_btc_ohlc_15m():
 def get_global_macro_data():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🌐 USDT ve USD Tahtalarından Makro Veriler Toplanıyor...")
 
-    # Terminal çıktısında OI'yi BTC yerine $ (kısaltmalı) göstermek için fiyat
-    # gerekiyor -- bu fonksiyonun dönüş değerini/DB'ye yazılan hiçbir şeyi
-    # etkilemez, sadece görüntüleme amaçlı. Fiyat çekilemezse (0 dönerse) BTC'ye
-    # düşülür (aşağıdaki print'lerde ayrıca kontrol ediliyor).
     _terminal_fiyat = get_btc_price()
 
     markets = {
@@ -304,11 +261,6 @@ def get_global_macro_data():
         'Hyperliquid': fetch_with_retry(get_custom_hyperliquid_data)
     }
 
-    # Huobi/HTX: diğer borsalarla aynı anda (dakika sınırında herkesin isteği
-    # aynı saniyeye denk geldiği "izdiham" anında) çağrılmıyor — kısa bir süre
-    # bekleyip trafiğin sakinleştiği bir ana kaydırıyoruz. Süre config.json ->
-    # huobi.delay_seconds ile ayarlanabilir (debug modunda hızlıca test etmek
-    # istersen 0'a çekebilirsin).
     huobi_delay = CONFIG.get('huobi', {}).get('delay_seconds', 30)
     if huobi_delay > 0:
         print(f"  ⏳ Huobi çağrılarından önce {huobi_delay}sn bekleniyor (dakika sınırı izdihamından kaçınmak için)...")
@@ -347,11 +299,6 @@ def get_global_macro_data():
     weighted_funding_sum = sum(oi * funding_8h for oi, funding_8h in normalized.values() if oi > 0)
     global_weighted_funding = (weighted_funding_sum / total_oi_btc) if total_oi_btc > 0 else 0
 
-    # Linear (USDT/USDC marjinli — Hyperliquid de USDC marjinli olduğu için buraya
-    # dahil) ile inverse (USD/coin marjinli) OI'yi AYRI topluyoruz — teminat matematiği
-    # farklı olduğu için likidasyon haritası bu ikisine farklı formül uygulayacak.
-    # Terminal/Telegram çıktısı hâlâ sadece total_oi_btc'yi (toplam) gösteriyor, bu
-    # ayrım sadece DB'ye ek kolon olarak gidiyor, görünürdeki hiçbir şey değişmiyor.
     oi_linear_btc = sum(
         oi for borsa, (oi, _) in normalized.items()
         if oi > 0 and (borsa.endswith('_USDT') or borsa == 'Hyperliquid')
