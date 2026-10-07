@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import json
+import re
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -13,6 +19,7 @@ from database import (
     fetch_closed_signals,
     fetch_history_series,
     fetch_latest_veri,
+    fetch_price_near_hours_ago,
     fetch_realized_liquidations,
     get_settings,
     parse_iso_date,
@@ -34,9 +41,32 @@ app.add_middleware(
 )
 
 
+_SYMBOL_RE = re.compile(r"^[A-Z0-9]{4,20}$")
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True, "db": str(DB_PATH), "db_exists": DB_PATH.exists()}
+
+
+@app.get("/api/price")
+def ticker_price(symbol: str = "BTCUSDT"):
+    symbol = symbol.upper().strip()
+    if not _SYMBOL_RE.fullmatch(symbol):
+        raise HTTPException(status_code=400, detail="invalid symbol")
+    url = f"https://api.binance.com/api/v3/ticker/price?symbol={quote(symbol)}"
+    try:
+        req = Request(url, headers={"User-Agent": "CryptoHub-Dashboard"})
+        with urlopen(req, timeout=8) as resp:
+            payload = json.loads(resp.read().decode())
+    except HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Binance error: {exc.code}") from exc
+    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=502, detail="Binance ticker unavailable") from exc
+    try:
+        return {"symbol": str(payload["symbol"]), "price": float(payload["price"])}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="unexpected ticker payload") from exc
 
 
 @app.get("/api/latest")
@@ -67,14 +97,15 @@ def overview():
 
 @app.get("/api/liquidation-map")
 def liquidation_map(layer: str = "linear", window: int = 12):
-    if layer not in ("linear", "inverse"):
-        raise HTTPException(status_code=400, detail="layer must be linear or inverse")
+    if layer not in ("linear", "inverse", "all"):
+        raise HTTPException(status_code=400, detail="layer must be linear, inverse, or all")
     if window not in (12, 24):
         raise HTTPException(status_code=400, detail="window must be 12 or 24")
     try:
         latest = fetch_latest_veri()
         price = float(latest["price"]) if latest and latest.get("price") is not None else None
-        return serialize_estimated_map(layer, window, price)
+        reference = fetch_price_near_hours_ago(window)
+        return serialize_estimated_map(layer, window, price, reference)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:

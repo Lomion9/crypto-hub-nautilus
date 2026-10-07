@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { NavLink } from "react-router-dom";
+import CoinSelector from "./CoinSelector";
 
 const links = [
   { to: "/", label: "Dashboard" },
@@ -32,6 +33,7 @@ export default function Layout({ children }: { children: ReactNode }) {
             ))}
           </nav>
         </div>
+        <CoinSelector />
       </header>
       <main>{children}</main>
     </div>

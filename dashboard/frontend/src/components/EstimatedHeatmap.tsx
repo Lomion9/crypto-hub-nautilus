@@ -2,44 +2,35 @@ import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import type { EstimatedMap, LiqLevel } from "../api";
 import { formatBtc, formatPrice } from "../format";
 
-const LONG = "#ef5350";
-const SHORT = "#26a69a";
+const BAR = "#2dd4bf";
 
 type Hover = { x: number; y: number; level: LiqLevel } | null;
 
-export default function EstimatedHeatmap({
-  data,
-  rangePct,
-}: {
-  data: EstimatedMap;
-  rangePct: number | null;
-}) {
+function autoRange(data: EstimatedMap): { minP: number; maxP: number } | null {
+  const current = data.current_price;
+  const reference = data.reference_price;
+  if (current == null && reference == null) return null;
+  const lo = Math.min(current ?? reference!, reference ?? current!);
+  const hi = Math.max(current ?? reference!, reference ?? current!);
+  return { minP: lo * 0.95, maxP: hi * 1.05 };
+}
+
+export default function EstimatedHeatmap({ data }: { data: EstimatedMap }) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [hover, setHover] = useState<Hover>(null);
 
+  const range = useMemo(() => autoRange(data), [data]);
+
   const visible = useMemo(() => {
-    const price = data.current_price;
-    if (rangePct == null || price == null) return data.levels;
-    const lo = price * (1 - rangePct / 100);
-    const hi = price * (1 + rangePct / 100);
-    return data.levels.filter((l) => l.price >= lo && l.price <= hi);
-  }, [data, rangePct]);
+    if (!range) return data.levels;
+    return data.levels.filter((l) => l.price >= range.minP && l.price <= range.maxP);
+  }, [data.levels, range]);
 
   const scale = useMemo(() => {
-    const prices = visible.map((l) => l.price);
-    if (data.current_price != null) {
-      if (rangePct == null) prices.push(data.current_price);
-      else {
-        prices.push(data.current_price * (1 - rangePct / 100));
-        prices.push(data.current_price * (1 + rangePct / 100));
-      }
-    }
-    if (!prices.length) return null;
-    const minP = Math.min(...prices);
-    const maxP = Math.max(...prices);
-    return { minP, maxP, span: maxP - minP || 1 };
-  }, [visible, data.current_price, rangePct]);
+    if (!range) return null;
+    return { minP: range.minP, maxP: range.maxP, span: range.maxP - range.minP || 1 };
+  }, [range]);
 
   useEffect(() => {
     const wrap = wrapRef.current;
@@ -60,38 +51,32 @@ export default function EstimatedHeatmap({
       ctx.fillStyle = "#0b0b0d";
       ctx.fillRect(0, 0, width, height);
 
-      const pad = { top: 16, right: 78, bottom: 28, left: 16 };
+      const pad = { top: 16, right: 78, bottom: 16, left: 16 };
       const innerW = width - pad.left - pad.right;
       const innerH = height - pad.top - pad.bottom;
-      const midX = pad.left + innerW / 2;
+      const rightX = pad.left + innerW;
 
       if (!scale || innerW <= 0 || innerH <= 0) {
         ctx.fillStyle = "#71717a";
         ctx.font = "12px Inter, sans-serif";
-        ctx.fillText(visible.length ? "Küme yok" : "Bu aralıkta küme yok", 20, 32);
+        ctx.fillText("Küme yok", 20, 32);
         return;
       }
 
       const yOf = (price: number) => pad.top + ((scale.maxP - price) / scale.span) * innerH;
       const maxAmt = Math.max(...visible.map((l) => l.amount_btc), 1e-9);
-      const maxBar = innerW / 2 - 8;
+      const maxBar = innerW - 8;
 
       ctx.strokeStyle = "#1f1f23";
       ctx.beginPath();
       for (let i = 0; i <= 6; i++) {
         const y = pad.top + (innerH * i) / 6;
         ctx.moveTo(pad.left, y);
-        ctx.lineTo(pad.left + innerW, y);
+        ctx.lineTo(rightX, y);
       }
       ctx.stroke();
 
-      ctx.strokeStyle = "#27272a";
-      ctx.beginPath();
-      ctx.moveTo(midX, pad.top);
-      ctx.lineTo(midX, pad.top + innerH);
-      ctx.stroke();
-
-      ctx.fillStyle = "#71717a";
+      ctx.fillStyle = "#a1a1aa";
       ctx.font = "10px Inter, sans-serif";
       for (let i = 0; i <= 6; i++) {
         const price = scale.maxP - (scale.span * i) / 6;
@@ -104,14 +89,9 @@ export default function EstimatedHeatmap({
         const y = yOf(level.price);
         const w = Math.max(2, (level.amount_btc / maxAmt) * maxBar);
         const intensity = 0.22 + 0.78 * (level.amount_btc / maxAmt);
-        const longSide = level.side.toLowerCase().includes("long");
         ctx.globalAlpha = intensity;
-        ctx.fillStyle = longSide ? LONG : SHORT;
-        if (longSide) {
-          ctx.fillRect(midX - w, y - bandH / 2, w, bandH);
-        } else {
-          ctx.fillRect(midX, y - bandH / 2, w, bandH);
-        }
+        ctx.fillStyle = BAR;
+        ctx.fillRect(rightX - w, y - bandH / 2, w, bandH);
       }
       ctx.globalAlpha = 1;
 
@@ -121,18 +101,13 @@ export default function EstimatedHeatmap({
         ctx.setLineDash([4, 4]);
         ctx.beginPath();
         ctx.moveTo(pad.left, y);
-        ctx.lineTo(width - pad.right, y);
+        ctx.lineTo(rightX, y);
         ctx.stroke();
         ctx.setLineDash([]);
         ctx.fillStyle = "#e4e4e7";
         ctx.font = "11px Inter, sans-serif";
         ctx.fillText(`$${formatPrice(data.current_price)}`, width - pad.right + 6, y + 4);
       }
-
-      ctx.fillStyle = "#71717a";
-      ctx.font = "10px Inter, sans-serif";
-      ctx.fillText("LONG →", pad.left, height - 10);
-      ctx.fillText("← SHORT", width - pad.right - 52, height - 10);
     };
 
     draw();
@@ -148,7 +123,7 @@ export default function EstimatedHeatmap({
     const y = event.clientY - rect.top;
     const height = rect.height;
     const padTop = 16;
-    const padBottom = 28;
+    const padBottom = 16;
     const innerH = height - padTop - padBottom;
     const price = scale.maxP - ((y - padTop) / innerH) * scale.span;
     let best: LiqLevel | null = null;

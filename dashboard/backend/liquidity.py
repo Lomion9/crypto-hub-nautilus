@@ -26,21 +26,32 @@ def get_harita(*, force: bool = False) -> dict:
     return _CACHE
 
 
-def serialize_estimated_map(layer: str, window_h: int, current_price: float | None) -> dict:
+def _clusters_for_window(katmanlar: dict, layer: str, window_h: int) -> dict[tuple[float, str], float]:
+    names = ("linear", "inverse") if layer == "all" else (layer,)
+    merged: dict[tuple[float, str], float] = {}
+    for name in names:
+        pencereler = katmanlar.get(name) or {}
+        kumeler = pencereler.get(window_h) or pencereler.get(int(window_h)) or {}
+        for anahtar, miktar in (kumeler or {}).items():
+            fiyat, yon = anahtar
+            key = (float(fiyat), str(yon))
+            merged[key] = merged.get(key, 0.0) + float(miktar)
+    return merged
+
+
+def serialize_estimated_map(
+    layer: str,
+    window_h: int,
+    current_price: float | None,
+    reference_price: float | None = None,
+) -> dict:
     harita = get_harita()
     katmanlar = harita.get("katmanlar") or {}
-    pencereler = katmanlar.get(layer) or {}
-    kumeler = pencereler.get(window_h) or pencereler.get(int(window_h)) or {}
-    levels = []
-    for anahtar, miktar in (kumeler or {}).items():
-        fiyat, yon = anahtar
-        levels.append(
-            {
-                "price": float(fiyat),
-                "side": str(yon),
-                "amount_btc": float(miktar),
-            }
-        )
+    merged = _clusters_for_window(katmanlar, layer, window_h)
+    levels = [
+        {"price": fiyat, "side": yon, "amount_btc": miktar}
+        for (fiyat, yon), miktar in merged.items()
+    ]
     levels.sort(key=lambda item: item["price"])
     guncel_oi = {}
     for key, value in (harita.get("guncel_oi") or {}).items():
@@ -49,6 +60,7 @@ def serialize_estimated_map(layer: str, window_h: int, current_price: float | No
         "layer": layer,
         "window_h": int(window_h),
         "current_price": current_price,
+        "reference_price": reference_price,
         "guncel_oi": guncel_oi,
         "levels": levels,
     }

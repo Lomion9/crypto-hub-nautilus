@@ -7,7 +7,7 @@ The dashboard-owned `settings` table is the only table this module writes.
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -38,6 +38,36 @@ def fetch_latest_veri() -> dict | None:
         return dict(row) if row else None
     finally:
         conn.close()
+
+
+def fetch_price_near_hours_ago(window_h: int) -> float | None:
+    """Price from the veri row closest to `window_h` hours before the latest snapshot."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT tarih, saat, price FROM veri WHERE price IS NOT NULL ORDER BY id DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return None
+    latest_dt = parse_tr_datetime(rows[0]["tarih"], rows[0]["saat"])
+    if latest_dt is None:
+        return None
+    target = latest_dt - timedelta(hours=int(window_h))
+    closest_price: float | None = None
+    closest_delta: float | None = None
+    for row in rows:
+        dt = parse_tr_datetime(row["tarih"], row["saat"])
+        if dt is None:
+            continue
+        delta = abs((dt - target).total_seconds())
+        if closest_delta is None or delta < closest_delta:
+            closest_delta = delta
+            closest_price = float(row["price"])
+        if dt <= target:
+            break
+    return closest_price
 
 
 def parse_tr_datetime(tarih: str | None, saat: str | None) -> datetime | None:

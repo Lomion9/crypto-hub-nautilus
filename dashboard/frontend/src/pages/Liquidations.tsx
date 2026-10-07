@@ -3,24 +3,35 @@ import {
   fetchLiquidationMap,
   fetchRealizedLiquidations,
   type EstimatedMap,
+  type LiqLayer,
   type RealizedLiq,
 } from "../api";
 import EstimatedHeatmap from "../components/EstimatedHeatmap";
 import RealizedScatter from "../components/RealizedScatter";
 import { formatBtc, localIsoDate, localIsoDaysAgo } from "../format";
 
-const RANGES: Array<{ label: string; pct: number | null }> = [
-  { label: "±5%", pct: 5 },
-  { label: "±10%", pct: 10 },
-  { label: "±20%", pct: 20 },
-  { label: "Tümü", pct: null },
+const LAYERS: Array<{ id: LiqLayer; label: string }> = [
+  { id: "linear", label: "linear" },
+  { id: "inverse", label: "inverse" },
+  { id: "all", label: "tümü" },
 ];
+
+function oiLabel(map: EstimatedMap, layer: LiqLayer): string | null {
+  const oi = map.guncel_oi;
+  if (layer === "all") {
+    const parts: string[] = [];
+    if (oi.linear != null) parts.push(`lin ${formatBtc(oi.linear, 0)}`);
+    if (oi.inverse != null) parts.push(`inv ${formatBtc(oi.inverse, 0)}`);
+    return parts.length ? `OI ${parts.join(" · ")} BTC` : null;
+  }
+  const value = oi[layer];
+  return value != null ? `OI ${formatBtc(value, 0)} BTC` : null;
+}
 
 export default function Liquidations() {
   const [tab, setTab] = useState<"estimated" | "realized">("estimated");
-  const [layer, setLayer] = useState<"linear" | "inverse">("linear");
+  const [layer, setLayer] = useState<LiqLayer>("linear");
   const [windowH, setWindowH] = useState<12 | 24>(12);
-  const [rangePct, setRangePct] = useState<number | null>(10);
   const [map, setMap] = useState<EstimatedMap | null>(null);
   const [events, setEvents] = useState<RealizedLiq[]>([]);
   const [start, setStart] = useState(localIsoDaysAgo(7));
@@ -78,6 +89,8 @@ export default function Liquidations() {
     };
   }, [tab, start, end]);
 
+  const oiText = map ? oiLabel(map, layer) : null;
+
   return (
     <div className="flex h-[calc(100vh-49px)] flex-col px-6 py-4">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
@@ -113,16 +126,16 @@ export default function Liquidations() {
 
       {tab === "estimated" ? (
         <div className="mb-3 flex flex-wrap items-center gap-2">
-          {(["linear", "inverse"] as const).map((item) => (
+          {LAYERS.map((item) => (
             <button
-              key={item}
+              key={item.id}
               type="button"
-              onClick={() => setLayer(item)}
+              onClick={() => setLayer(item.id)}
               className={`rounded-md border px-2.5 py-1 text-xs ${
-                layer === item ? "border-zinc-500 text-zinc-100" : "border-zinc-800 text-zinc-500"
+                layer === item.id ? "border-zinc-500 text-zinc-100" : "border-zinc-800 text-zinc-500"
               }`}
             >
-              {item}
+              {item.label}
             </button>
           ))}
           {([12, 24] as const).map((item) => (
@@ -137,27 +150,7 @@ export default function Liquidations() {
               {item}s
             </button>
           ))}
-          <span className="mx-1 h-4 w-px bg-zinc-800" />
-          {RANGES.map((item) => (
-            <button
-              key={item.label}
-              type="button"
-              onClick={() => setRangePct(item.pct)}
-              className={`rounded-md border px-2.5 py-1 text-xs ${
-                rangePct === item.pct ? "border-zinc-500 text-zinc-100" : "border-zinc-800 text-zinc-500"
-              }`}
-            >
-              {item.label}
-            </button>
-          ))}
-          {map?.guncel_oi?.[layer] != null ? (
-            <span className="self-center text-xs text-zinc-500">
-              OI {formatBtc(map.guncel_oi[layer], 0)} BTC
-            </span>
-          ) : null}
-          <span className="ml-auto self-center text-[11px] text-zinc-600">
-            kırmızı = long liq · yeşil = short liq
-          </span>
+          {oiText ? <span className="self-center text-xs text-zinc-500">{oiText}</span> : null}
         </div>
       ) : (
         <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-zinc-400">
@@ -186,7 +179,7 @@ export default function Liquidations() {
         {tab === "estimated" && !map && loading ? (
           <p className="p-4 text-sm text-zinc-500">Harita hesaplanıyor...</p>
         ) : null}
-        {tab === "estimated" && map ? <EstimatedHeatmap data={map} rangePct={rangePct} /> : null}
+        {tab === "estimated" && map ? <EstimatedHeatmap data={map} /> : null}
         {tab === "realized" && loading && !events.length ? (
           <p className="p-4 text-sm text-zinc-500">Yükleniyor...</p>
         ) : null}

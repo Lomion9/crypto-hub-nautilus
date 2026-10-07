@@ -87,6 +87,19 @@ export async function saveSettings(payload: {
   return res.json();
 }
 
+export type TickerPrice = {
+  symbol: string;
+  price: number;
+};
+
+export async function fetchTickerPrice(symbol: string): Promise<TickerPrice> {
+  const res = await fetch(`/api/price?symbol=${encodeURIComponent(symbol)}`);
+  if (!res.ok) {
+    throw new Error("Fiyat okunamadı");
+  }
+  return res.json();
+}
+
 export async function fetchOverview(): Promise<Overview> {
   const res = await fetch("/api/overview");
   if (!res.ok) {
@@ -127,16 +140,19 @@ export type LiqLevel = {
   amount_btc: number;
 };
 
+export type LiqLayer = "linear" | "inverse" | "all";
+
 export type EstimatedMap = {
   layer: string;
   window_h: number;
   current_price: number | null;
+  reference_price: number | null;
   guncel_oi: { linear?: number | null; inverse?: number | null };
   levels: LiqLevel[];
 };
 
 export async function fetchLiquidationMap(
-  layer: "linear" | "inverse",
+  layer: LiqLayer,
   window: 12 | 24,
 ): Promise<EstimatedMap> {
   const res = await fetch(`/api/liquidation-map?layer=${layer}&window=${window}`);
