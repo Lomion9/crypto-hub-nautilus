@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QScrollArea,
@@ -90,6 +91,7 @@ from desktop.okx_trade import (
     Creds,
     OkxError,
     available_usdt as okx_available,
+    close_position as okx_close_position,
     execute as okx_execute,
     fetch_positions,
     ping as okx_ping,
@@ -1092,7 +1094,7 @@ def _margin_pct(data: dict) -> int:
 
 POSITION_COLUMNS = (
     "Coin", "Yön", "Boyut", "Giriş", "Mark", "PnL", "Likidasyon",
-    "Marjin", "Kaldıraç", "TP", "SL", "Trailing", "İşlem",
+    "Marjin", "Kaldıraç", "TP", "SL", "Trailing", "Kaynak", "İşlem",
 )
 LIQ_NEAR = QColor("#ff9800")
 
@@ -3323,7 +3325,9 @@ class _OkxAction(QThread):
     def run(self) -> None:
         job = self._request
         try:
-            if job.get("kind") == "tpsl":
+            if job.get("kind") == "close":
+                result = okx_close_position(self._creds, job["position"], self._simulated)
+            elif job.get("kind") == "tpsl":
                 result = okx_set_tp_sl(self._creds, job["position"], job.get("tp"), job.get("sl"), self._simulated)
             else:
                 result = okx_set_trailing(
@@ -3337,8 +3341,8 @@ class _OkxAction(QThread):
         except OkxError as exc:
             self.done.emit(False, str(exc), job)
             return
-        except Exception:
-            self.done.emit(False, "Emir gönderilemedi", job)
+        except Exception as exc:
+            self.done.emit(False, f"Emir gönderilemedi: {exc}", job)
             return
         job = dict(job)
         job["result"] = result
@@ -6005,9 +6009,10 @@ class MainWindow(QMainWindow):
         table.setMinimumHeight(150)
         header = table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        for name in ("PnL", "Trailing", "İşlem"):
+        for name in ("PnL", "Trailing", "Kaynak", "İşlem"):
             header.setSectionResizeMode(POSITION_COLUMNS.index(name), QHeaderView.ResizeMode.ResizeToContents)
         table.setMaximumHeight(240)
+        table.itemDoubleClicked.connect(self._open_position_chart)
         self._okx_table = table
         column.addWidget(table)
         self._okx_live_note = QLabel("")
@@ -6554,6 +6559,20 @@ class MainWindow(QMainWindow):
                 when = f"{clock}   " if clock else ""
                 lines.append(f"{label}   {when}{verdict}   Hedef yok")
             lines.append(_score_line(coin, label))
+        lines.append("")
+        lines.append("Açık pozisyonlar")
+        live = getattr(self, "_okx_live", None) or []
+        if not live:
+            lines.append("—")
+        for position in live:
+            side = "Long" if position.get("side") == "up" else "Short"
+            upl = position.get("upl")
+            pnl = f"{float(upl):+.2f}" if isinstance(upl, (int, float)) else "—"
+            lines.append(
+                f"{base_of(str(position.get('symbol') or ''))}  {side}  {position.get('sz') or '—'}  "
+                f"{pnl} USDT  {self._okx_origin(position)}"
+            )
+            lines.append(f"TP {_price_text(position.get('tp'))}  SL {_price_text(position.get('sl'))}")
         self._active_body.setText("\n".join(lines))
 
     def _show_symbol(self, symbol: str) -> None:
@@ -7678,6 +7697,7 @@ class MainWindow(QMainWindow):
             self._paint_okx_size()
         self._render_okx_positions()
         self._paint_position_lines()
+        self._paint_active()
 
     def _on_okx_positions_fail(self, message: str) -> None:
         self._okx_live_error = message
@@ -7686,6 +7706,20 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _okx_row_key(position: dict) -> str:
         return f"{position.get('inst')}|{position.get('pos_side')}"
+
+    def _open_position_chart(self, _item) -> None:
+        row = _item.row()
+        if row < 0 or row >= len(self._okx_live):
+            return
+        symbol = str(self._okx_live[row].get("symbol") or "")
+        if not symbol or symbol == self._symbol:
+            self._set_page("market")
+            return
+        self._symbol = symbol
+        _save_state(self._symbol, self._interval)
+        self._show_symbol(symbol)
+        self._start_snapshot(force=True)
+        self._set_page("market")
 
     def _okx_position(self, key: str) -> dict | None:
         for position in self._okx_live:
@@ -7709,7 +7743,10 @@ class MainWindow(QMainWindow):
                     table.setItem(row, column, item)
                 table.setCellWidget(row, table.columnCount() - 1, self._okx_buttons(key))
         for row, position in enumerate(positions):
-            for column, (text, color) in enumerate(_position_cells(position)):
+            cells = _position_cells(position)
+            origin = self._okx_origin(position)
+            cells.append((origin, MUTED if origin == "Elle" else FLAT))
+            for column, (text, color) in enumerate(cells):
                 item = table.item(row, column)
                 if item is None:
                     continue
@@ -7733,15 +7770,16 @@ class MainWindow(QMainWindow):
         holder = QWidget()
         row = QHBoxLayout(holder)
         row.setContentsMargins(2, 0, 2, 0)
-        row.setSpacing(4)
-        tp_sl = QPushButton("TP/SL")
-        trail = QPushButton("Trailing")
-        for button in (tp_sl, trail):
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setStyleSheet("padding: 1px 8px;")
-            row.addWidget(button)
-        tp_sl.clicked.connect(lambda _checked=False, key=key: self._edit_tp_sl(key))
-        trail.clicked.connect(lambda _checked=False, key=key: self._edit_trailing(key))
+        button = QPushButton("İşlem")
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setStyleSheet("padding: 1px 8px;")
+        menu = QMenu(button)
+        menu.addAction("TP / SL", lambda _checked=False, key=key: self._edit_tp_sl(key))
+        menu.addAction("Trailing stop", lambda _checked=False, key=key: self._edit_trailing(key))
+        menu.addSeparator()
+        menu.addAction("Pozisyonu kapat", lambda _checked=False, key=key: self._close_okx_position(key))
+        button.setMenu(menu)
+        row.addWidget(button)
         return holder
 
     def _okx_busy(self) -> bool:
@@ -7772,6 +7810,23 @@ class MainWindow(QMainWindow):
         job.update(chosen)
         self._send_okx_action(job)
 
+    def _close_okx_position(self, key: str) -> None:
+        position = self._okx_position(key)
+        if position is None or self._okx_busy():
+            return
+        word = "Long" if position.get("side") == "up" else "Short"
+        name = base_of(str(position.get("symbol") or ""))
+        answer = QMessageBox.question(
+            self,
+            "Pozisyonu kapat",
+            f"{name} {word} · {position.get('sz')} sözleşme piyasa fiyatından kapanacak.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._send_okx_action({"kind": "close", "position": dict(position)})
+
     def _send_okx_action(self, job: dict) -> None:
         creds, simulated = self._okx_account()
         if not creds.ready():
@@ -7787,12 +7842,52 @@ class MainWindow(QMainWindow):
         name = base_of(str(position.get("symbol") or "")) if isinstance(position, dict) else ""
         text = f"{name} {message}".strip()
         self.statusBar().showMessage(text)
-        if hasattr(self, "_okx_log"):
-            self._okx_log.setText(text)
-            self._okx_log.setStyleSheet("color: #26a69a;" if ok else "color: #ef5350;")
-        if ok and isinstance(job, dict) and job.get("kind") == "tpsl" and isinstance(position, dict):
-            self._mark_manual(position, job.get("result") or {})
+        if isinstance(position, dict):
+            _okx_note(str(position.get("symbol") or ""), "", str(job.get("kind") or "") if isinstance(job, dict) else "", ok, message)
+            self._show_okx_log()
+        if ok and isinstance(job, dict) and isinstance(position, dict):
+            if job.get("kind") == "close":
+                self._forget_okx_held(position)
+            elif job.get("kind") == "tpsl":
+                self._mark_manual(position, job.get("result") or {})
         self._poll_okx(True)
+
+    def _okx_held_match(self, position: dict, held: dict) -> bool:
+        if held.get("inst") != position.get("inst"):
+            return False
+        return held.get("pos_side") == position.get("pos_side") or held.get("side") == position.get("side")
+
+    def _okx_origin(self, position: dict) -> str:
+        """Uygulamanın açtığı pozisyon Otomatik, OKX'ten elle açılan Elle."""
+        stored = _read_state().get("okx_positions")
+        coin = stored.get(position.get("symbol")) if isinstance(stored, dict) else None
+        if isinstance(coin, dict):
+            for held in coin.values():
+                if isinstance(held, dict) and self._okx_held_match(position, held):
+                    return "Otomatik"
+        return "Elle"
+
+    def _forget_okx_held(self, position: dict) -> None:
+        """Elle kapanan pozisyonu bot kaydından çıkarır; sonraki sinyal kapalı emri tekrar kapatmaya çalışmaz."""
+        stored = _read_state().get("okx_positions")
+        if not isinstance(stored, dict):
+            return
+        symbol = str(position.get("symbol") or "")
+        coin = stored.get(symbol)
+        if not isinstance(coin, dict):
+            return
+        kept = {
+            label: held
+            for label, held in coin.items()
+            if not isinstance(held, dict) or not self._okx_held_match(position, held)
+        }
+        if len(kept) == len(coin):
+            return
+        if kept:
+            stored[symbol] = kept
+        else:
+            stored.pop(symbol, None)
+        _patch_state(okx_positions=stored)
 
     def _mark_manual(self, position: dict, result: dict) -> None:
         """Elle TP/SL girilen pozisyonda bot TP'yi artık değiştirmez."""

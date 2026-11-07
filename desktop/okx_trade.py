@@ -216,6 +216,15 @@ def _set_leverage(creds: Creds, inst: str, lever: int, mode: str, pos_side: str,
     return use
 
 
+def close_position(creds: Creds, position: dict, simulated: bool) -> dict:
+    """Açık pozisyonun tamamını piyasa emriyle kapatır."""
+    if not position.get("inst") or not str(position.get("sz") or ""):
+        raise OkxError("Pozisyon okunamadı")
+    _close(creds, position, simulated)
+    word = "long" if position.get("side") == "up" else "short"
+    return {"message": f"{word} kapatıldı · {position.get('sz')} sözleşme"}
+
+
 def _close(creds: Creds, held: dict, simulated: bool) -> None:
     pos_side = str(held.get("pos_side") or "net")
     trade_side = str(held.get("side") or "")
