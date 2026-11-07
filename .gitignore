@@ -5,3 +5,6 @@ nautilus-env/
 .vscode/
 dashboard/frontend/node_modules/
 dashboard/frontend/dist/
+build/
+dist/
+*.spec
