@@ -99,6 +99,14 @@ class Snapshot:
     warning: str | None
     session_change: float | None = None
     touches: dict = field(default_factory=dict)
+    oi_venues_up: int = 0
+    oi_venues_known: int = 0
+    funding_venues_up: int = 0
+    funding_venues_known: int = 0
+    cvd_perp_up: int = 0
+    cvd_perp_known: int = 0
+    cvd_spot_up: int = 0
+    cvd_spot_known: int = 0
 
 
 def base_of(symbol: str) -> str:
@@ -264,23 +272,9 @@ def _try_klines(symbol: str, interval: str, limit: int, futures: bool) -> list[B
 
 
 def _oi_points(symbol: str) -> list[Point]:
-    try:
-        raw = _get(
-            f"{FAPI}/futures/data/openInterestHist",
-            {"symbol": symbol, "period": "15m", "limit": 180},
-        )
-    except MarketError:
-        return []
-    if not isinstance(raw, list):
-        return []
-    points: list[Point] = []
-    for row in raw:
-        try:
-            points.append(Point(int(row["timestamp"]), float(row["sumOpenInterest"])))
-        except (KeyError, TypeError, ValueError):
-            continue
-    points.sort(key=lambda point: point.time_ms)
-    return points
+    from desktop.oi_feed import load_oi
+
+    return list(load_oi(symbol).series.get("15m") or [])
 
 
 def bucket_funding(points: list[Point], hours: int) -> list[Point]:
@@ -625,16 +619,10 @@ def _fresh_klines(symbol: str, interval: str, futures: bool, bar_ms: int) -> lis
 
 
 def _fresh_oi(symbol: str, interval: str) -> list[Point]:
+    from desktop.oi_feed import load_oi
+
     period = _OI_PERIOD[interval]
-    bar_ms = {"1h": HOUR_MS, "2h": 2 * HOUR_MS, "4h": 4 * HOUR_MS, "1d": 24 * HOUR_MS}[period]
-
-    def load() -> list[Point]:
-        points = _oi_hist(symbol, period)
-        if not points and period == "2h":
-            return _oi_hist(symbol, "1h", 80)
-        return points
-
-    return _fresh((symbol, "oi", period), bar_ms, load)
+    return list(load_oi(symbol).series.get(period) or [])
 
 
 def _aligned_oi(points: list[Point], bars: list[Bar], bar_ms: int) -> list[Point]:
@@ -674,6 +662,9 @@ def _one_window(
     funding_points: list[tuple[int, float]],
     live_funding: float | None,
     keep_open: bool = False,
+    cvd_perp: float | None = None,
+    cvd_spot: float | None = None,
+    from_feed: bool = False,
 ) -> tuple[Window, tuple]:
     closed = list(perp) if keep_open else _closed_bars(perp, now_ms, bar_ms)
     closed_spot = list(spot) if keep_open else _closed_bars(spot, now_ms, bar_ms)
@@ -694,8 +685,9 @@ def _one_window(
     funding_delta = None
     if live_funding is not None and past_funding is not None:
         funding_delta = live_funding - past_funding
-    cvd_perp = None if last is None else last.cvd_delta
-    cvd_spot = None if spot_bar is None else spot_bar.cvd_delta
+    if not from_feed:
+        cvd_perp = None if last is None else last.cvd_delta
+        cvd_spot = None if spot_bar is None else spot_bar.cvd_delta
     window = Window(
         label=label,
         price_pct=_pct(None if last is None else last.close, None if previous is None else previous.close),
@@ -731,14 +723,16 @@ def load_snapshot(
             fut_perp = pool.submit(cached_klines, symbol, "15m", True, HISTORY_BARS, True)
             fut_chart = pool.submit(cached_klines, symbol, chart_interval, True, CHART_BARS) if with_chart else None
         fut_spot = pool.submit(cached_klines, symbol, "15m", False, HISTORY_BARS)
-        fut_oi = pool.submit(_oi_points, symbol)
-        fut_funding = pool.submit(_funding_points, symbol)
+        from desktop.oi_feed import load_oi
+        from desktop.cvd_feed import load_cvd
+
+        fut_oi = pool.submit(load_oi, symbol)
+        fut_cvd = pool.submit(load_cvd, symbol)
         fut_live = pool.submit(_live, symbol)
         extra = {
             label: (
                 pool.submit(_fresh_klines, symbol, interval, True, bar_ms),
                 pool.submit(_fresh_klines, symbol, interval, False, bar_ms),
-                pool.submit(_fresh_oi, symbol, interval),
             )
             for label, interval, bar_ms in wanted
         }
@@ -752,12 +746,22 @@ def load_snapshot(
         except MarketError as exc:
             raise MarketError(str(exc)) from exc
         spot = fut_spot.result()
-        oi_points = fut_oi.result()
-        funding_points = fut_funding.result()
-        mark, oi_base, funding, next_ms = fut_live.result()
+        oi_pack = fut_oi.result()
+        oi_points = list(oi_pack.series.get("15m") or [])
+        from desktop.funding_feed import load_funding
+
+        fund_pack = load_funding(symbol)
+        funding_points = fund_pack.hourly
+        funding = fund_pack.live
+        next_ms = fund_pack.next_ms
+        mark, _binance_oi, _binance_funding, _binance_next = fut_live.result()
+        try:
+            cvd_pack = fut_cvd.result()
+        except Exception:
+            cvd_pack = None
         fetched = {
-            label: (perp_f.result(), spot_f.result(), oi_f.result())
-            for label, (perp_f, spot_f, oi_f) in extra.items()
+            label: (perp_f.result(), spot_f.result())
+            for label, (perp_f, spot_f) in extra.items()
         }
 
     if not perp:
@@ -769,6 +773,7 @@ def load_snapshot(
     price = chart_bars[-1].close if chart_bars else mark
     if price is None:
         price = perp[-1].close
+    oi_base = oi_pack.live
     if oi_base is None and oi_points:
         oi_base = oi_points[-1].value
     oi_usd = oi_base * price if oi_base is not None and price is not None else None
@@ -796,7 +801,16 @@ def load_snapshot(
                 series_oi = [point for point in series_oi if point.time_ms < stamp]
                 series_oi.append(Point(stamp, oi_base))
         else:
-            series_perp, series_spot, series_oi = fetched[label]
+            series_perp, series_spot = fetched[label]
+            period = _OI_PERIOD[_interval]
+            series_oi = list(oi_pack.series.get(period) or [])
+        closed_probe = series_perp if label == "15dk" else _closed_bars(series_perp, now_ms, bar_ms)
+        last_bar = closed_probe[-1] if closed_probe else None
+        if last_bar is None or cvd_pack is None:
+            feed_perp = feed_spot = None
+        else:
+            feed_perp = cvd_pack.bar("perp", last_bar.time_ms, last_bar.time_ms + bar_ms, now_ms)
+            feed_spot = cvd_pack.bar("spot", last_bar.time_ms, last_bar.time_ms + bar_ms, now_ms)
         window, bundle = _one_window(
             label,
             series_perp,
@@ -807,6 +821,9 @@ def load_snapshot(
             funding_points,
             funding,
             keep_open=label == "15dk",
+            cvd_perp=feed_perp,
+            cvd_spot=feed_spot,
+            from_feed=True,
         )
         windows.append(window)
         bundles[label] = bundle
@@ -821,8 +838,8 @@ def load_snapshot(
         oi_usd=oi_usd,
         funding_percent=funding,
         next_funding_ms=next_ms,
-        cvd_spot_day=_session_cvd(spot),
-        cvd_perp_day=_session_cvd(perp),
+        cvd_spot_day=None if cvd_pack is None else cvd_pack.spot_day,
+        cvd_perp_day=None if cvd_pack is None else cvd_pack.perp_day,
         candles=chart_bars,
         oi_points=oi_points,
         windows=windows,
@@ -831,4 +848,12 @@ def load_snapshot(
         funding_hourly=hourly_funding(funding_points, funding, now_ms),
         warning=warning,
         session_change=_session_price_pct(perp),
+        oi_venues_up=oi_pack.up,
+        oi_venues_known=oi_pack.known,
+        funding_venues_up=fund_pack.up,
+        funding_venues_known=fund_pack.known,
+        cvd_perp_up=0 if cvd_pack is None else cvd_pack.perp_up,
+        cvd_perp_known=0 if cvd_pack is None else cvd_pack.perp_known,
+        cvd_spot_up=0 if cvd_pack is None else cvd_pack.spot_up,
+        cvd_spot_known=0 if cvd_pack is None else cvd_pack.spot_known,
     )

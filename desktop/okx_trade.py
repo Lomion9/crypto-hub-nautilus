@@ -135,6 +135,18 @@ def ping(creds: Creds, simulated: bool) -> str:
     return f"Bağlandı · {where} · USDT {amount} · {mode}"
 
 
+def max_leverage(symbol: str) -> int:
+    """Sözleşmenin izin verdiği en yüksek kaldıraç."""
+    info = _public_instrument(inst_id(symbol))
+    try:
+        cap = int(float(info.get("lever") or 0))
+    except (TypeError, ValueError):
+        cap = 0
+    if cap < 1:
+        raise OkxError("Kaldıraç sınırı alınamadı")
+    return cap
+
+
 def _public_instrument(inst: str) -> dict:
     try:
         response = requests.get(
@@ -192,6 +204,72 @@ def _contracts(margin: float, leverage: int, price: float, info: dict) -> tuple[
     return _text_step(size, lot), size
 
 
+def _max_contracts(
+    creds: Creds,
+    inst: str,
+    mode: str,
+    side: str,
+    leverage: int,
+    simulated: bool,
+    px: float | None,
+    info: dict,
+) -> float | None:
+    """OKX'in bu marjinle kabul ettiği en büyük sözleşme. Piyasada fiyat payı OKX'te kalır."""
+    path = f"/api/v5/account/max-size?instId={inst}&tdMode={mode}&leverage={int(leverage)}"
+    if isinstance(px, (int, float)) and float(px) > 0:
+        _px, px_text = _tick_text(float(px), info)
+        path += f"&px={px_text}"
+    try:
+        payload = request(creds, "GET", path, simulated=simulated)
+    except OkxError:
+        return None
+    rows = payload.get("data") or []
+    row = rows[0] if rows and isinstance(rows[0], dict) else {}
+    key = "maxBuy" if side == "up" else "maxSell"
+    try:
+        value = float(row.get(key))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value
+
+
+def _order_size(
+    creds: Creds,
+    inst: str,
+    side: str,
+    margin: float,
+    leverage: int,
+    price: float,
+    info: dict,
+    mode: str,
+    simulated: bool,
+    limit_px: float | None,
+) -> tuple[str, float]:
+    """Seçilen bakiyenin yüzdesi, OKX'in sığdırabildiği boyu geçmez."""
+    lot = float(info.get("lotSz") or 1)
+    minimum = float(info.get("minSz") or lot or 1)
+    cap = _max_contracts(creds, inst, mode, side, leverage, simulated, limit_px, info)
+    available = available_usdt(creds, simulated)
+    if cap is not None and available > 0 and lot > 0:
+        fraction = min(1.0, max(0.0, margin / available))
+        allowed = _floor_step(cap * fraction, lot)
+        hard_key = "maxLmtSz" if limit_px else "maxMktSz"
+        try:
+            hard = float(info.get(hard_key) or 0)
+        except (TypeError, ValueError):
+            hard = 0.0
+        if hard > 0:
+            allowed = min(allowed, _floor_step(hard, lot))
+        if allowed + 1e-12 < minimum or allowed <= 0:
+            raise OkxError("Marjin bu kaldıraçla en küçük sözleşmenin altında")
+        return _text_step(allowed, lot), allowed
+    band = 0.0 if limit_px else 0.015
+    usable = margin / (1.0 + max(leverage, 1) * 0.0005 + band)
+    return _contracts(usable, leverage, price, info)
+
+
 SPOT_ONLY = (
     "OKX hesabın Spot modunda, vadeli işlem açılamaz. "
     "OKX'te Ayarlar > Hesap modu > Spot ve vadeli (Futures) moduna geç."
@@ -208,7 +286,12 @@ def _hedge(creds: Creds, simulated: bool) -> bool:
 
 
 def _set_leverage(creds: Creds, inst: str, lever: int, mode: str, pos_side: str, simulated: bool, cap: int) -> int:
-    use = max(1, min(int(lever), cap if cap > 0 else int(lever)))
+    asked = int(lever)
+    if asked < 1:
+        raise OkxError("Kaldıraç seçilmedi")
+    if cap > 0 and asked > cap:
+        raise OkxError(f"OKX bu sözleşmede en fazla {cap}x kaldıraca izin veriyor")
+    use = asked
     body = {"instId": inst, "lever": str(use), "mgnMode": mode}
     if pos_side in ("long", "short"):
         body["posSide"] = pos_side
@@ -246,6 +329,68 @@ def _close(creds: Creds, held: dict, simulated: bool) -> None:
     request(creds, "POST", "/api/v5/trade/order", body, simulated)
 
 
+def open_market(
+    creds: Creds,
+    symbol: str,
+    side: str,
+    price: float,
+    margin: float,
+    leverage: int,
+    mode: str,
+    simulated: bool,
+    limit: float | None = None,
+) -> dict:
+    """Piyasa veya limit emri. Take profit eklenmez; boy marjin ve kaldıraçla hesaplanır."""
+    if side not in ("up", "down"):
+        raise OkxError("Yön yok, emir yok")
+    if price <= 0:
+        raise OkxError("Fiyat yok, emir yok")
+    if margin <= 0:
+        raise OkxError("Kullanılabilir bakiye yok")
+    if leverage < 1:
+        raise OkxError("Kaldıraç seçilmedi")
+    if mode not in ("cross", "isolated"):
+        mode = "cross"
+    inst = inst_id(symbol)
+    info = _public_instrument(inst)
+    hedge = _hedge(creds, simulated)
+    pos_side = ("long" if side == "up" else "short") if hedge else "net"
+    try:
+        cap = int(float(info.get("lever") or leverage))
+    except (TypeError, ValueError):
+        cap = leverage
+    used = _set_leverage(creds, inst, leverage, mode, pos_side, simulated, cap)
+    limit_px = float(limit) if isinstance(limit, (int, float)) and float(limit) > 0 else None
+    sized_at = limit_px if limit_px else price
+    sz, _size = _order_size(creds, inst, side, margin, used, sized_at, info, mode, simulated, limit_px)
+    body = {
+        "instId": inst,
+        "tdMode": mode,
+        "side": "buy" if side == "up" else "sell",
+        "ordType": "market",
+        "sz": sz,
+    }
+    extra = ""
+    if isinstance(limit, (int, float)) and float(limit) > 0:
+        px, px_text = _tick_text(float(limit), info)
+        body["ordType"] = "limit"
+        body["px"] = px_text
+        extra = f" · limit {format_price(px)}"
+    if pos_side in ("long", "short"):
+        body["posSide"] = pos_side
+    request(creds, "POST", "/api/v5/trade/order", body, simulated)
+    word = "long" if side == "up" else "short"
+    return {
+        "inst": inst,
+        "symbol": symbol,
+        "side": side,
+        "pos_side": pos_side,
+        "sz": sz,
+        "td_mode": mode,
+        "message": f"{word} açıldı · {sz} sözleşme{extra}",
+    }
+
+
 def _open(creds: Creds, symbol: str, side: str, tp: float, price: float, margin: float, leverage: int, mode: str, simulated: bool) -> dict:
     if side not in ("up", "down"):
         raise OkxError("Yön yok, emir yok")
@@ -270,7 +415,7 @@ def _open(creds: Creds, symbol: str, side: str, tp: float, price: float, margin:
     except (TypeError, ValueError):
         cap = leverage
     used = _set_leverage(creds, inst, leverage, mode, pos_side, simulated, cap)
-    sz, _size = _contracts(margin, used, price, info)
+    sz, _size = _order_size(creds, inst, side, margin, used, price, info, mode, simulated, None)
     order_side = "buy" if side == "up" else "sell"
     body = {
         "instId": inst,
@@ -579,6 +724,7 @@ def fetch_positions(creds: Creds, simulated: bool) -> list[dict]:
                 "sz": str(row.get("pos") or "").strip().lstrip("-"),
                 "size": abs(amount),
                 "avg": _number(row.get("avgPx")),
+                "be": _number(row.get("bePx")),
                 "mark": _number(row.get("markPx")),
                 "upl": _number(row.get("upl")),
                 "upl_ratio": _number(row.get("uplRatio")),

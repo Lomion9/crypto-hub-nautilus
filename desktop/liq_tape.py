@@ -1,8 +1,9 @@
 """Binance USDT-M likidasyon bandı ve saatlik arşiv.
 
-Akış sembol başına bir saniyede yalnızca son likidasyon emrini verir. Çığ saatleri
-eksik sayılır; ilerideki skor mutlak değil, göreli okunur. Karşılaştırma yalnız bu
-bantla ve Binance USDT-M haritasıyla yapılır. Ekrandaki dört borsa toplanmaz.
+Likidasyon yalnız BTC içindir. Akış market ucundadır; eski /ws adresi 23 Nisan
+2026'da kapanmıştır, bağlı kalıp mesaj vermez. Binance aynı saniyedeki emirlerden
+yalnız en büyüğünü yollar. Çığ saatleri eksik sayılır; ilerideki skor mutlak değil,
+göreli okunur. Karşılaştırma yalnız bu bantla ve Binance USDT-M haritasıyla yapılır.
 
 Bir saat skora girerse mum_saat ve oi_saat satırları vardır, tek bir oturum saatin
 tamamını örter ve bir önceki saat de arşivdedir. Model açık pozisyon farkını
@@ -24,7 +25,8 @@ from PySide6.QtWebSockets import QWebSocket
 
 from desktop.market import HOUR_MS, MarketError, fetch_klines, fetch_oi_page
 
-STREAM = "wss://fstream.binance.com/ws/!forceOrder@arr"
+STREAM = "wss://fstream.binance.com/market/ws/btcusdt@forceOrder"
+LIQ_SYMBOL = "BTCUSDT"
 TAPE_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 DECISION_SYMBOL = "BTCUSDT"
 PONG_MS = 60_000
@@ -83,9 +85,21 @@ def _event_row(payload: dict) -> tuple[int, str, str, float, float, float] | Non
         yon = "short"
     else:
         return None
-    if not symbol or price <= 0 or qty <= 0 or stamp <= 0:
+    if symbol != LIQ_SYMBOL or price <= 0 or qty <= 0 or stamp <= 0:
         return None
     return stamp, symbol, yon, price, qty, price * qty
+
+
+def _event_rows(payload) -> list[tuple[int, str, str, float, float, float]]:
+    items = payload if isinstance(payload, list) else [payload]
+    rows = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        row = _event_row(item)
+        if row is not None:
+            rows.append(row)
+    return rows
 
 
 def _ensure(conn: sqlite3.Connection) -> None:
@@ -377,12 +391,10 @@ class LiquidationTape(QObject):
             payload = json.loads(text)
         except ValueError:
             return
-        if not isinstance(payload, dict):
+        rows = _event_rows(payload)
+        if not rows:
             return
-        row = _event_row(payload)
-        if row is None:
-            return
-        self._buf.append(row)
+        self._buf.extend(rows)
         if len(self._buf) >= BUFFER_LIMIT:
             now = int(time.time() * 1000)
             self._flush(now, advance=pong_fresh(self._last_pong, now))

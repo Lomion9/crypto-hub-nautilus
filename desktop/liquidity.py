@@ -1,7 +1,8 @@
 """Tahmini likidasyon haritası. Borsalar pozisyon fiyatını yayınlamaz; bu bir modeldir.
 
-Fiyat, açık pozisyon ve kaldıraç basamağı Binance, Bybit, OKX ve Hyperliquid'den ayrı kurulur.
-Kovalar ortak fiyat adımında dolar olarak toplanır. Coin bir borsada yoksa o borsa atlanır.
+Her sözleşme kendi saati, coin açık pozisyonu ve kaldıraç basamağıyla kurulur.
+USDT, USDC ve USD ayrı kitaptır. Kovalar ortak fiyat adımında dolar olarak toplanır.
+Coin bir sözleşmede yoksa o kitap atlanır.
 """
 
 from __future__ import annotations
@@ -9,8 +10,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 import time
 import urllib.request
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from urllib.parse import quote
@@ -37,12 +40,14 @@ class Cluster:
 
 @dataclass
 class VenueBook:
-    """Bir borsanın kendi saati, açık pozisyonu ve kaldıraç tavanı."""
+    """Bir sözleşmenin kendi saati, coin açık pozisyonu ve kaldıraç tavanı."""
 
     bars: list[Bar]
     oi: list[Point]
     margin: float
     max_leverage: int
+    name: str = ""
+    inverse: bool = False
 
 
 @dataclass
@@ -223,6 +228,23 @@ def _peaks(
     return [Cluster(level, usd) for level, usd in chosen]
 
 
+def _liq_price(typical: float, level: int, margin: float, inverse: bool, side: str) -> float:
+    """Lineer ve ters sözleşmenin likidasyon fiyatı. Ters kitap lineer formüle girmez."""
+    if typical <= 0 or level < 1:
+        return 0.0
+    if not inverse:
+        if side == "long":
+            return typical * (1 - 1 / level + margin)
+        return typical * (1 + 1 / level - margin)
+    if side == "long":
+        denom = level + 1 - margin * level
+    else:
+        denom = level - 1 + margin * level
+    if denom <= 0:
+        return 0.0
+    return typical * level / denom
+
+
 def build_map(
     symbol: str,
     bars: list[Bar],
@@ -231,6 +253,7 @@ def build_map(
     max_leverage: int,
     conserved: bool = False,
     sweep: dict[int, tuple[float, float]] | None = None,
+    inverse: bool = False,
 ) -> LiquidityMap:
     """Saat saat açık pozisyonu kovalar. OI artışı yeni pozisyon, düşüş oransal kapanıştır.
     sweep: saat → (en düşük, en yüksek); grafikte gösterilen borsanın fitili de silmeye katılır."""
@@ -290,8 +313,20 @@ def build_map(
                     new_longs = delta * min(1.0, 2 * share)
                     new_shorts = delta * min(1.0, 2 * (1 - share))
                 for level, weight in weights.items():
-                    _add(longs, typical * (1 - 1 / level + margin), new_longs * weight, step, long_mass)
-                    _add(shorts, typical * (1 + 1 / level - margin), new_shorts * weight, step, short_mass)
+                    _add(
+                        longs,
+                        _liq_price(typical, level, margin, inverse, "long"),
+                        new_longs * weight,
+                        step,
+                        long_mass,
+                    )
+                    _add(
+                        shorts,
+                        _liq_price(typical, level, margin, inverse, "short"),
+                        new_shorts * weight,
+                        step,
+                        short_mass,
+                    )
         if current is not None and current > 0:
             previous = current
         times.append(bar.time_ms)
@@ -347,13 +382,25 @@ def _peaks_usd(
 
 def merge_venues(symbol: str, venues: list[VenueBook], conserved: bool = False) -> LiquidityMap:
     """Her borsanın kendi haritasını kurar, dolar kovalarını ortak adımda toplar."""
+    sweep_venue = next((venue for venue in venues if venue.name == "binance-usdt"), None)
+    if sweep_venue is None and venues:
+        sweep_venue = venues[0]
     sweep: dict[int, tuple[float, float]] = {}
-    if venues:
-        for bar in venues[0].bars:
+    if sweep_venue is not None:
+        for bar in sweep_venue.bars:
             if bar.low > 0 and bar.high > 0:
                 sweep[bar.time_ms // HOUR_MS * HOUR_MS] = (bar.low, bar.high)
     built = [
-        build_map(symbol, venue.bars, venue.oi, venue.margin, venue.max_leverage, conserved, sweep)
+        build_map(
+            symbol,
+            venue.bars,
+            venue.oi,
+            venue.margin,
+            venue.max_leverage,
+            conserved,
+            sweep,
+            venue.inverse,
+        )
         for venue in venues
     ]
     built = [book for book in built if book.times and book.closes]
@@ -418,7 +465,7 @@ def merge_venues(symbol: str, venues: list[VenueBook], conserved: bool = False) 
     last_levels = result.levels[-1] if result.levels else {}
     result.long_peaks = _peaks_usd(result.columns[-1], step, price, "long", last_levels)
     result.short_peaks = _peaks_usd(result.columns[-1], step, price, "short", last_levels)
-    first = venues[0]
+    first = sweep_venue if sweep_venue is not None else venues[0]
     result.source_bars = list(first.bars)
     result.source_oi = list(first.oi)
     result.margin = first.margin
@@ -442,7 +489,14 @@ def _closed_hours(bars: list[Bar]) -> list[Bar]:
     return bars
 
 
-def _trim_venue(bars: list[Bar], oi_points: list[Point], margin: float, leverage: int) -> VenueBook | None:
+def _trim_venue(
+    bars: list[Bar],
+    oi_points: list[Point],
+    margin: float,
+    leverage: int,
+    name: str = "",
+    inverse: bool = False,
+) -> VenueBook | None:
     bars = _closed_hours(bars)
     if bars:
         cutoff = bars[-1].time_ms
@@ -457,7 +511,12 @@ def _trim_venue(bars: list[Bar], oi_points: list[Point], margin: float, leverage
         margin = 0.004
     if leverage < 1:
         leverage = 100
-    return VenueBook(bars[-800:], oi_points, margin, leverage)
+    return VenueBook(bars[-800:], oi_points, margin, leverage, name, inverse)
+
+
+def _coin(symbol: str) -> str:
+    symbol = symbol.upper().strip()
+    return symbol[:-4] if symbol.endswith("USDT") else symbol
 
 
 def _binance_venue(symbol: str) -> VenueBook | None:
@@ -467,13 +526,132 @@ def _binance_venue(symbol: str) -> VenueBook | None:
         margin, leverage = fetch_leverage_tier(symbol)
     except MarketError:
         return None
-    return _trim_venue(bars, oi_points, margin, leverage)
+    return _trim_venue(bars, oi_points, margin, leverage, "binance-usdt")
+
+
+def _binance_usdc_venue(symbol: str) -> VenueBook | None:
+    coin = _coin(symbol)
+    market = f"{coin}USDC"
+    try:
+        bars = fetch_klines(market, "1h", 800, True)
+        oi_points = fetch_hourly_oi(market)
+        margin, leverage = fetch_leverage_tier(market)
+    except MarketError:
+        return None
+    return _trim_venue(bars, oi_points, margin, leverage, "binance-usdc")
+
+
+def _inverse_coin(contracts: float, value: float, mark: float | None, size: float) -> float | None:
+    """Coin-M geçmişinde value bazen coin, bazen dolar. Mark ile ayırt edilir."""
+    if contracts <= 0 or size <= 0:
+        return None
+    if mark and mark > 0:
+        from_contracts = contracts * size / mark
+        if value > 0 and abs(value - from_contracts) / from_contracts < 0.35:
+            return value
+        return from_contracts
+    if value > 0 and value < contracts:
+        return value
+    return None
+
+
+def _dapi_bars(symbol: str) -> list[Bar]:
+    payload = _read_json(
+        "https://dapi.binance.com/dapi/v1/klines"
+        f"?symbol={quote(symbol)}&interval=1h&limit=800"
+    )
+    if not isinstance(payload, list):
+        return []
+    bars: list[Bar] = []
+    for row in payload:
+        try:
+            volume = float(row[5])
+            taker_buy = float(row[9])
+            bars.append(
+                Bar(
+                    time_ms=int(row[0]),
+                    open=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                    cvd_delta=taker_buy - (volume - taker_buy),
+                    volume=volume,
+                )
+            )
+        except (IndexError, TypeError, ValueError):
+            continue
+    bars.sort(key=lambda bar: bar.time_ms)
+    return bars
+
+
+def _dapi_oi(coin: str) -> list[Point]:
+    mark_row = _read_json(f"https://dapi.binance.com/dapi/v1/premiumIndex?symbol={quote(coin)}USD_PERP")
+    row = mark_row[0] if isinstance(mark_row, list) and mark_row else mark_row
+    mark = None
+    if isinstance(row, dict):
+        try:
+            mark = float(row["markPrice"])
+        except (KeyError, TypeError, ValueError):
+            mark = None
+    size = 100.0 if coin == "BTC" else 10.0
+    end = int(time.time() * 1000)
+    points: list[Point] = []
+    seen: set[int] = set()
+    for _ in range(4):
+        payload = _read_json(
+            "https://dapi.binance.com/futures/data/openInterestHist"
+            f"?pair={quote(coin)}USD&contractType=PERPETUAL&period=1h&limit=500&endTime={end}"
+        )
+        if not isinstance(payload, list) or not payload:
+            break
+        batch: list[Point] = []
+        for item in payload:
+            try:
+                stamp = int(item["timestamp"])
+                contracts = float(item["sumOpenInterest"])
+                value = float(item["sumOpenInterestValue"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            coin_oi = _inverse_coin(contracts, value, mark, size)
+            if stamp in seen or coin_oi is None or coin_oi <= 0:
+                continue
+            seen.add(stamp)
+            batch.append(Point(stamp, coin_oi))
+        if not batch:
+            break
+        points.extend(batch)
+        if len(payload) < 500:
+            break
+        end = min(point.time_ms for point in batch) - 1
+    points.sort(key=lambda point: point.time_ms)
+    return points
+
+
+def _binance_usd_venue(symbol: str) -> VenueBook | None:
+    coin = _coin(symbol)
+    market = f"{coin}USD_PERP"
+    bars = _dapi_bars(market)
+    points = _dapi_oi(coin)
+    margin, leverage = 0.004, 100
+    return _trim_venue(bars, points, margin, leverage, "binance-usd", True)
 
 
 def _bybit_venue(symbol: str) -> VenueBook | None:
+    return _bybit_book(symbol, "linear", "bybit-usdt", False)
+
+
+def _bybit_usdc_venue(symbol: str) -> VenueBook | None:
+    return _bybit_book(f"{_coin(symbol)}PERP", "linear", "bybit-usdc", False)
+
+
+def _bybit_usd_venue(symbol: str) -> VenueBook | None:
+    return _bybit_book(f"{_coin(symbol)}USD", "inverse", "bybit-usd", True)
+
+
+def _bybit_book(market: str, category: str, name: str, inverse: bool) -> VenueBook | None:
     payload = _read_json(
         "https://api.bybit.com/v5/market/kline"
-        f"?category=linear&symbol={quote(symbol)}&interval=60&limit=1000"
+        f"?category={quote(category)}&symbol={quote(market)}&interval=60&limit=1000"
     )
     rows = ((payload or {}).get("result") or {}).get("list") or []
     bars: list[Bar] = []
@@ -494,13 +672,14 @@ def _bybit_venue(symbol: str) -> VenueBook | None:
         except (IndexError, TypeError, ValueError):
             continue
     bars.sort(key=lambda bar: bar.time_ms)
+    closes = {bar.time_ms // HOUR_MS * HOUR_MS: bar.close for bar in bars if bar.close > 0}
     points: list[Point] = []
     seen: set[int] = set()
     cursor = ""
     for _ in range(6):
         url = (
             "https://api.bybit.com/v5/market/open-interest"
-            f"?category=linear&symbol={quote(symbol)}&intervalTime=1h&limit=200"
+            f"?category={quote(category)}&symbol={quote(market)}&intervalTime=1h&limit=200"
         )
         if cursor:
             url += "&cursor=" + (cursor if "%" in cursor else quote(cursor, safe=""))
@@ -515,6 +694,11 @@ def _bybit_venue(symbol: str) -> VenueBook | None:
                 value = float(row["openInterest"])
             except (KeyError, TypeError, ValueError):
                 continue
+            if inverse:
+                price = closes.get(stamp // HOUR_MS * HOUR_MS)
+                if not price or price <= 0:
+                    continue
+                value = value / price
             if stamp in seen or value <= 0:
                 continue
             seen.add(stamp)
@@ -525,7 +709,7 @@ def _bybit_venue(symbol: str) -> VenueBook | None:
     points.sort(key=lambda point: point.time_ms)
     risk = _read_json(
         "https://api.bybit.com/v5/market/risk-limit"
-        f"?category=linear&symbol={quote(symbol)}"
+        f"?category={quote(category)}&symbol={quote(market)}"
     )
     tiers = ((risk or {}).get("result") or {}).get("list") or []
     margin, leverage = 0.004, 100
@@ -538,7 +722,7 @@ def _bybit_venue(symbol: str) -> VenueBook | None:
             leverage = int(float(chosen["maxLeverage"]))
         except (KeyError, TypeError, ValueError):
             margin, leverage = 0.004, 100
-    return _trim_venue(bars, points, margin, leverage)
+    return _trim_venue(bars, points, margin, leverage, name, inverse)
 
 
 def _okx_inst(symbol: str) -> tuple[str, str]:
@@ -570,6 +754,15 @@ def _okx_pages(url: str, pages: int) -> list:
 
 def _okx_venue(symbol: str) -> VenueBook | None:
     inst, family = _okx_inst(symbol)
+    return _okx_book(inst, family, "okx-usdt", False)
+
+
+def _okx_usd_venue(symbol: str) -> VenueBook | None:
+    coin = _coin(symbol)
+    return _okx_book(f"{coin}-USD-SWAP", f"{coin}-USD", "okx-usd", True)
+
+
+def _okx_book(inst: str, family: str, name: str, inverse: bool) -> VenueBook | None:
     inst_q = quote(inst)
     candle_rows: list = []
     latest = _read_json(f"https://www.okx.com/api/v5/market/candles?instId={inst_q}&bar=1H&limit=300")
@@ -677,7 +870,9 @@ def _okx_venue(symbol: str) -> VenueBook | None:
             best = (lever, mmr)
     if best is not None:
         leverage, margin = best
-    return _trim_venue(bars, points, margin, leverage)
+    if str((tiers or {}).get("code")) == "51001":
+        return None
+    return _trim_venue(bars, points, margin, leverage, name, inverse)
 
 
 HL_INFO = "https://api.hyperliquid.xyz/info"
@@ -824,17 +1019,490 @@ def _hyperliquid_venue(symbol: str) -> VenueBook | None:
     leverage = max(levers)
     margin = 1.0 / (2 * leverage) if leverage >= 1 else 0.004
     points = _hl_oi_series(coin, live_oi, now_ms)
-    return _trim_venue(bars, points, margin, leverage)
+    return _trim_venue(bars, points, margin, leverage, "hyperliquid-usdc")
+
+
+def _iso_ms(text: str) -> int | None:
+    try:
+        stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return int(stamp.timestamp() * 1000)
+
+
+_MAP_OI_LOCK = threading.Lock()
+
+
+def _map_oi_path() -> str:
+    root = os.environ.get("APPDATA") or os.path.expanduser("~")
+    folder = os.path.join(root, "CryptoHub")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "map_oi.json")
+
+
+def _map_oi_series(key: str, live: float, now_ms: int) -> list[Point]:
+    """Borsa geçmişi olmayan kitapta her saat bir örnek. Tek örnek kütle yazmaz."""
+    path = _map_oi_path()
+    with _MAP_OI_LOCK:
+        stored: dict = {}
+        try:
+            with open(path, encoding="utf-8") as handle:
+                raw = json.load(handle)
+            if isinstance(raw, dict):
+                stored = raw
+        except (OSError, json.JSONDecodeError):
+            stored = {}
+        points: list[Point] = []
+        rows = stored.get(key)
+        if isinstance(rows, list):
+            for row in rows:
+                try:
+                    points.append(Point(int(row[0]), float(row[1])))
+                except (IndexError, TypeError, ValueError):
+                    continue
+        hour = now_ms // HOUR_MS * HOUR_MS
+        if live > 0 and (not points or points[-1].time_ms != hour):
+            points.append(Point(hour, live))
+        cutoff = hour - 40 * 24 * HOUR_MS
+        points = [point for point in points if point.time_ms >= cutoff and point.value > 0]
+        points.sort(key=lambda point: point.time_ms)
+        stored[key] = [[point.time_ms, point.value] for point in points]
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(stored, handle)
+        except OSError:
+            pass
+        return points
+
+
+def _htx_leverage(url: str) -> tuple[float, int]:
+    payload = _read_json(url)
+    data = (payload or {}).get("data") if isinstance(payload, dict) else None
+    levers: list[int] = []
+    for row in data or []:
+        if not isinstance(row, dict):
+            continue
+        for item in row.get("list") or []:
+            try:
+                levers.append(int(float(item["lever_rate"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    if not levers:
+        return 0.004, 100
+    leverage = max(levers)
+    margin = 1.0 / (2 * leverage) if leverage >= 1 else 0.004
+    return margin, leverage
+
+
+def _htx_bars(url: str) -> list[Bar]:
+    payload = _read_json(url)
+    rows = (payload or {}).get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+    bars: list[Bar] = []
+    for row in rows:
+        try:
+            bars.append(
+                Bar(
+                    time_ms=int(row["id"]) * 1000,
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    cvd_delta=0.0,
+                    volume=float(row["amount"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    bars.sort(key=lambda bar: bar.time_ms)
+    return bars
+
+
+def _htx_oi(url: str) -> list[Point]:
+    payload = _read_json(url)
+    if not isinstance(payload, dict) or payload.get("status") != "ok":
+        return []
+    data = payload.get("data")
+    ticks = data.get("tick") if isinstance(data, dict) else data
+    if not isinstance(ticks, list):
+        return []
+    points: list[Point] = []
+    seen: set[int] = set()
+    for row in ticks:
+        try:
+            stamp = int(row["ts"])
+            value = float(row["volume"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if stamp in seen or value <= 0:
+            continue
+        seen.add(stamp)
+        points.append(Point(stamp, value))
+    points.sort(key=lambda point: point.time_ms)
+    return points
+
+
+def _htx_usdt_venue(symbol: str) -> VenueBook | None:
+    coin = _coin(symbol)
+    code = quote(f"{coin}-USDT")
+    bars = _htx_bars(
+        "https://api.hbdm.com/linear-swap-ex/market/history/kline"
+        f"?contract_code={code}&period=60min&size=2000"
+    )
+    points = _htx_oi(
+        "https://api.hbdm.com/linear-swap-api/v1/swap_his_open_interest"
+        f"?contract_code={code}&period=60min&size=200&amount_type=2"
+    )
+    margin, leverage = _htx_leverage(
+        f"https://api.hbdm.com/linear-swap-api/v1/swap_ladder_margin?contract_code={code}"
+    )
+    return _trim_venue(bars, points, margin, leverage, "htx-usdt")
+
+
+def _htx_usd_venue(symbol: str) -> VenueBook | None:
+    coin = _coin(symbol)
+    code = quote(f"{coin}-USD")
+    bars = _htx_bars(
+        "https://api.hbdm.com/swap-ex/market/history/kline"
+        f"?contract_code={code}&period=60min&size=2000"
+    )
+    points = _htx_oi(
+        "https://api.hbdm.com/swap-api/v1/swap_his_open_interest"
+        f"?contract_code={code}&period=60min&size=200&amount_type=2"
+    )
+    margin, leverage = _htx_leverage(
+        f"https://api.hbdm.com/swap-api/v1/swap_ladder_margin?contract_code={code}"
+    )
+    return _trim_venue(bars, points, margin, leverage, "htx-usd", True)
+
+
+def _bitfinex_venue(symbol: str) -> VenueBook | None:
+    coin = _coin(symbol)
+    key = f"t{coin}F0:USTF0"
+    payload = _read_json(
+        f"https://api-pub.bitfinex.com/v2/candles/trade:1h:{quote(key, safe=':')}/hist?limit=1000&sort=-1"
+    )
+    if isinstance(payload, list) and payload and payload[0] == "error":
+        return None
+    bars: list[Bar] = []
+    if isinstance(payload, list):
+        for row in payload:
+            try:
+                bars.append(
+                    Bar(
+                        time_ms=int(row[0]),
+                        open=float(row[1]),
+                        high=float(row[3]),
+                        low=float(row[4]),
+                        close=float(row[2]),
+                        cvd_delta=0.0,
+                        volume=float(row[5]),
+                    )
+                )
+            except (IndexError, TypeError, ValueError):
+                continue
+    bars.sort(key=lambda bar: bar.time_ms)
+    rows: list = []
+    end = None
+    now_ms = int(time.time() * 1000)
+    for _ in range(12):
+        url = f"https://api-pub.bitfinex.com/v2/status/deriv/{quote(key, safe=':')}/hist?limit=5000&sort=-1"
+        if end is not None:
+            url += f"&end={end}"
+        page = _read_json(url)
+        if isinstance(page, list) and page and page[0] == "error":
+            break
+        if not isinstance(page, list) or not page or not isinstance(page[0], list):
+            break
+        rows.extend(page)
+        try:
+            oldest = min(int(row[0]) for row in page)
+        except (TypeError, ValueError, IndexError):
+            break
+        if now_ms - oldest >= 800 * HOUR_MS or len(page) < 5000:
+            break
+        end = oldest - 1
+    buckets: dict[int, float] = {}
+    for row in rows:
+        try:
+            stamp = int(row[0]) // HOUR_MS * HOUR_MS
+            value = float(row[17])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if value > 0:
+            buckets[stamp] = value
+    points = [Point(stamp, value) for stamp, value in sorted(buckets.items())]
+    return _trim_venue(bars, points, 0.004, 100, "bitfinex-usdt")
+
+
+def _deribit_venue(symbol: str) -> VenueBook | None:
+    coin = _coin(symbol)
+    now_ms = int(time.time() * 1000)
+    start = now_ms - 40 * 24 * HOUR_MS
+    payload = _read_json(
+        "https://www.deribit.com/api/v2/public/get_tradingview_chart_data"
+        f"?instrument_name={quote(coin)}-PERPETUAL&start_timestamp={start}&end_timestamp={now_ms}&resolution=60"
+    )
+    result = (payload or {}).get("result") if isinstance(payload, dict) else None
+    if not isinstance(result, dict):
+        return None
+    ticks = result.get("ticks") or []
+    opens = result.get("open") or []
+    highs = result.get("high") or []
+    lows = result.get("low") or []
+    closes = result.get("close") or []
+    volumes = result.get("volume") or []
+    bars: list[Bar] = []
+    for index, stamp in enumerate(ticks):
+        try:
+            bars.append(
+                Bar(
+                    time_ms=int(stamp),
+                    open=float(opens[index]),
+                    high=float(highs[index]),
+                    low=float(lows[index]),
+                    close=float(closes[index]),
+                    cvd_delta=0.0,
+                    volume=float(volumes[index]) if index < len(volumes) else 0.0,
+                )
+            )
+        except (IndexError, TypeError, ValueError):
+            continue
+    bars.sort(key=lambda bar: bar.time_ms)
+    summary = _read_json(
+        "https://www.deribit.com/api/v2/public/get_book_summary_by_instrument"
+        f"?instrument_name={quote(coin)}-PERPETUAL"
+    )
+    rows = (summary or {}).get("result") if isinstance(summary, dict) else None
+    live = 0.0
+    if isinstance(rows, list) and rows:
+        try:
+            mark = float(rows[0]["mark_price"])
+            usd = float(rows[0]["open_interest"])
+            if mark > 0 and usd > 0:
+                live = usd / mark
+        except (KeyError, TypeError, ValueError, IndexError):
+            live = 0.0
+    instrument = _read_json(
+        "https://www.deribit.com/api/v2/public/get_instrument"
+        f"?instrument_name={quote(coin)}-PERPETUAL"
+    )
+    info = (instrument or {}).get("result") if isinstance(instrument, dict) else None
+    leverage = 50
+    if isinstance(info, dict):
+        try:
+            leverage = int(float(info["max_leverage"]))
+        except (KeyError, TypeError, ValueError):
+            leverage = 50
+    if leverage < 1:
+        leverage = 50
+    margin = 1.0 / (2 * leverage)
+    points = _map_oi_series(f"deribit-usd:{coin}", live, now_ms)
+    return _trim_venue(bars, points, margin, leverage, "deribit-usd", True)
+
+
+def _kraken_symbol(coin: str) -> str:
+    base = "XBT" if coin == "BTC" else coin
+    return f"PF_{base}USD"
+
+
+def _kraken_venue(symbol: str) -> VenueBook | None:
+    coin = _coin(symbol)
+    market = _kraken_symbol(coin)
+    payload = _read_json(f"https://futures.kraken.com/api/charts/v1/trade/{quote(market)}/1h")
+    candles = (payload or {}).get("candles") if isinstance(payload, dict) else None
+    if not isinstance(candles, list):
+        return None
+    bars: list[Bar] = []
+    for row in candles:
+        try:
+            bars.append(
+                Bar(
+                    time_ms=int(row["time"]),
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    cvd_delta=0.0,
+                    volume=float(row["volume"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    bars.sort(key=lambda bar: bar.time_ms)
+    instruments = _read_json("https://futures.kraken.com/derivatives/api/v3/instruments")
+    listed = (instruments or {}).get("instruments") if isinstance(instruments, dict) else None
+    margin, leverage = 0.004, 100
+    if isinstance(listed, list):
+        found = next((row for row in listed if isinstance(row, dict) and row.get("symbol") == market), None)
+        levels = found.get("marginLevels") if isinstance(found, dict) else None
+        if isinstance(levels, list) and levels:
+            first = min(levels, key=lambda row: float(row.get("numNonContractUnits") or 0))
+            try:
+                kept_margin = float(first["maintenanceMargin"])
+                initial = float(first["initialMargin"])
+            except (KeyError, TypeError, ValueError):
+                kept_margin, initial = 0.0, 0.0
+            if 0 < kept_margin < 1 and initial > 0:
+                margin = kept_margin
+                leverage = max(1, int(round(1 / initial)))
+    tickers = _read_json("https://futures.kraken.com/derivatives/api/v3/tickers")
+    rows = (tickers or {}).get("tickers") if isinstance(tickers, dict) else None
+    live = 0.0
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict) and row.get("symbol") == market:
+                try:
+                    live = float(row["openInterest"])
+                except (KeyError, TypeError, ValueError):
+                    live = 0.0
+                break
+    now_ms = int(time.time() * 1000)
+    points = _map_oi_series(f"kraken-usd:{coin}", live, now_ms)
+    return _trim_venue(bars, points, margin, leverage, "kraken-usd")
+
+
+def _dydx_venue(symbol: str) -> VenueBook | None:
+    coin = _coin(symbol)
+    market = f"{coin}-USD"
+    rows: list = []
+    end = ""
+    for _ in range(10):
+        url = (
+            "https://indexer.dydx.trade/v4/candles/perpetualMarkets/"
+            f"{quote(market)}?resolution=1HOUR&limit=100"
+        )
+        if end:
+            url += "&toISO=" + quote(end)
+        payload = _read_json(url)
+        batch = (payload or {}).get("candles") if isinstance(payload, dict) else None
+        if not isinstance(batch, list) or not batch:
+            break
+        rows.extend(batch)
+        try:
+            oldest = min(str(row["startedAt"]) for row in batch)
+        except (KeyError, TypeError, ValueError):
+            break
+        if oldest == end or len(batch) < 100:
+            break
+        end = oldest
+    bars: list[Bar] = []
+    points: list[Point] = []
+    seen: set[int] = set()
+    for row in rows:
+        stamp = _iso_ms(str(row.get("startedAt") or ""))
+        if stamp is None or stamp in seen:
+            continue
+        try:
+            bar = Bar(
+                time_ms=stamp,
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+                cvd_delta=0.0,
+                volume=float(row.get("baseTokenVolume") or 0),
+            )
+            oi_value = float(row["startingOpenInterest"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        seen.add(stamp)
+        bars.append(bar)
+        if oi_value > 0:
+            points.append(Point(stamp, oi_value))
+    bars.sort(key=lambda bar: bar.time_ms)
+    points.sort(key=lambda point: point.time_ms)
+    markets = _read_json("https://indexer.dydx.trade/v4/perpetualMarkets")
+    book = ((markets or {}).get("markets") or {}).get(market) if isinstance(markets, dict) else None
+    margin, leverage = 0.004, 100
+    if isinstance(book, dict) and book.get("maintenanceMarginFraction") not in (None, ""):
+        try:
+            kept_margin = float(book["maintenanceMarginFraction"])
+            initial = float(book["initialMarginFraction"])
+        except (KeyError, TypeError, ValueError):
+            kept_margin, initial = 0.0, 0.0
+        if 0 < kept_margin < 1:
+            margin = kept_margin
+            leverage = max(1, int(round(1 / initial))) if initial > 0 else 100
+    return _trim_venue(bars, points, margin, leverage, "dydx-usd")
+
+
+def _woo_venue(symbol: str) -> VenueBook | None:
+    coin = _coin(symbol)
+    market = f"PERP_{coin}_USDT"
+    payload = _read_json(f"https://api.woox.io/v1/public/kline?symbol={quote(market)}&type=1h&limit=1000")
+    rows = (payload or {}).get("rows") if isinstance(payload, dict) else None
+    if payload is not None and isinstance(payload, dict) and payload.get("success") is False:
+        return None
+    bars: list[Bar] = []
+    if isinstance(rows, list):
+        for row in rows:
+            try:
+                bars.append(
+                    Bar(
+                        time_ms=int(row["start_timestamp"]),
+                        open=float(row["open"]),
+                        high=float(row["high"]),
+                        low=float(row["low"]),
+                        close=float(row["close"]),
+                        cvd_delta=0.0,
+                        volume=float(row["volume"]),
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+    bars.sort(key=lambda bar: bar.time_ms)
+    info = _read_json(f"https://api.woox.io/v1/public/info/{quote(market)}")
+    body = (info or {}).get("info") if isinstance(info, dict) else None
+    margin, leverage = 0.004, 100
+    if isinstance(body, dict):
+        try:
+            kept_margin = float(body["base_mmr"])
+            initial = float(body["base_imr"])
+        except (KeyError, TypeError, ValueError):
+            kept_margin, initial = 0.0, 0.0
+        if 0 < kept_margin < 1:
+            margin = kept_margin
+            leverage = max(1, int(round(1 / initial))) if initial > 0 else 100
+    live_payload = _read_json(f"https://api.woox.io/v1/public/futures/{quote(market)}")
+    live_info = (live_payload or {}).get("info") if isinstance(live_payload, dict) else None
+    live = 0.0
+    if isinstance(live_info, dict):
+        try:
+            live = float(live_info["open_interest"])
+        except (KeyError, TypeError, ValueError):
+            live = 0.0
+    now_ms = int(time.time() * 1000)
+    points = _map_oi_series(f"woo-usdt:{coin}", live, now_ms)
+    return _trim_venue(bars, points, margin, leverage, "woo-usdt")
 
 
 def load_liquidity(symbol: str) -> LiquidityMap:
     symbol = symbol.upper().strip()
     venues: list[VenueBook] = []
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        jobs = [
-            pool.submit(loader, symbol)
-            for loader in (_binance_venue, _bybit_venue, _okx_venue, _hyperliquid_venue)
-        ]
+    loaders = (
+        _binance_venue,
+        _binance_usdc_venue,
+        _binance_usd_venue,
+        _bybit_venue,
+        _bybit_usdc_venue,
+        _bybit_usd_venue,
+        _okx_venue,
+        _okx_usd_venue,
+        _htx_usdt_venue,
+        _htx_usd_venue,
+        _bitfinex_venue,
+        _hyperliquid_venue,
+        _deribit_venue,
+        _kraken_venue,
+        _dydx_venue,
+        _woo_venue,
+    )
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        jobs = [pool.submit(loader, symbol) for loader in loaders]
         for job in jobs:
             try:
                 venue = job.result()
@@ -859,7 +1527,16 @@ def clip_map(book: LiquidityMap, hours: int, conserved: bool = False) -> Liquidi
             start = bars[0].time_ms if bars else 0
             oi_points = [point for point in venue.oi if not bars or point.time_ms >= start - HOUR_MS]
             if bars and oi_points:
-                clipped.append(VenueBook(bars, oi_points, venue.margin, venue.max_leverage))
+                clipped.append(
+                    VenueBook(
+                        bars,
+                        oi_points,
+                        venue.margin,
+                        venue.max_leverage,
+                        venue.name,
+                        venue.inverse,
+                    )
+                )
         merged = merge_venues(book.symbol, clipped, conserved)
         merged.venues = book.venues
         return merged
