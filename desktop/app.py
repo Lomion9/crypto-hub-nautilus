@@ -109,6 +109,7 @@ from desktop.format import (
     format_quantity,
     format_usd,
 )
+from desktop.volume_profile import VolumeProfile, load_profiles
 from desktop.market import (
     CHART_BARS,
     CHART_INTERVALS,
@@ -5339,6 +5340,111 @@ class _LiqCandleWorker(QThread):
         self.done.emit(bars)
 
 
+class _ProfileColumn(QWidget):
+    """Bir seansın hacim profili. POC, değer alanı, tepe ve çukur."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._profile: VolumeProfile | None = None
+        self.setMinimumWidth(200)
+
+    def set_profile(self, profile: VolumeProfile | None) -> None:
+        self._profile = profile
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#0b0b0d"))
+        profile = self._profile
+        if profile is None:
+            return
+        painter.setPen(QColor("#fafafa"))
+        painter.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
+        title = profile.name + (" · sürüyor" if profile.developing else " · kapandı" if not profile.note else "")
+        painter.drawText(QRectF(12, 8, self.width() - 24, 22), Qt.AlignmentFlag.AlignLeft, title)
+        start = datetime.fromtimestamp(profile.start_ms / 1000, timezone.utc)
+        end = datetime.fromtimestamp(profile.end_ms / 1000, timezone.utc)
+        end_text = "24:00" if end.hour == 0 and end.minute == 0 else f"{end:%H:%M}"
+        painter.setPen(QColor("#a1a1aa"))
+        painter.setFont(QFont("Consolas", 9))
+        painter.drawText(
+            QRectF(12, 30, self.width() - 24, 16),
+            Qt.AlignmentFlag.AlignLeft,
+            f"{start:%H:%M}–{end_text} UTC",
+        )
+        if profile.note or not profile.rows:
+            painter.drawText(QRectF(12, 64, self.width() - 24, 24), Qt.AlignmentFlag.AlignLeft, profile.note or "veri yok")
+            return
+        top = 58.0
+        bottom = float(self.height() - 16)
+        left = 78.0
+        right = float(self.width() - 14)
+        if bottom - top < 40 or right - left < 20:
+            return
+        high = profile.rows[-1].high
+        low = profile.rows[0].low
+        span = high - low
+        if span <= 0:
+            return
+        widest = max(row.total for row in profile.rows) or 1.0
+
+        def y_of(price: float) -> float:
+            return top + (high - price) / span * (bottom - top)
+
+        if profile.val is not None and profile.vah is not None:
+            band_top = y_of(profile.vah)
+            band_bottom = y_of(profile.val)
+            painter.fillRect(QRectF(left, band_top, right - left, band_bottom - band_top), QColor(41, 98, 255, 28))
+        for row in profile.rows:
+            y1 = y_of(row.high)
+            y2 = y_of(row.low)
+            height = max(1.0, y2 - y1 - 1.0)
+            width = (row.total / widest) * (right - left) if row.total > 0 else 0.0
+            inside = (
+                profile.val is not None
+                and profile.vah is not None
+                and row.low >= profile.val - 1e-9
+                and row.high <= profile.vah + 1e-9
+            )
+            up_color = QColor("#60a5fa") if inside else QColor("#3f3f46")
+            down_color = QColor("#f5c451") if inside else QColor("#71717a")
+            up_width = width * (row.up / row.total) if row.total else 0.0
+            painter.fillRect(QRectF(left, y1, up_width, height), up_color)
+            painter.fillRect(QRectF(left + up_width, y1, max(0.0, width - up_width), height), down_color)
+            if row.kind:
+                painter.setPen(QColor("#93c5fd") if row.kind == "tepe" else QColor("#d4d4d8"))
+                painter.drawText(QRectF(left + width + 4, y1 - 2, 48, height + 4), Qt.AlignmentFlag.AlignLeft, row.kind)
+        painter.setFont(QFont("Consolas", 8))
+        for price, label, color in (
+            (profile.vah, "VAH", "#60a5fa"),
+            (profile.poc, "POC", "#f5c451"),
+            (profile.val, "VAL", "#60a5fa"),
+        ):
+            if price is None:
+                continue
+            y = y_of(price)
+            painter.setPen(QColor(color))
+            painter.drawLine(int(left), int(y), int(right), int(y))
+            painter.drawText(QRectF(8, y - 8, left - 12, 16), Qt.AlignmentFlag.AlignRight, f"{label} {format_price(price)}")
+
+
+class _VolumeWorker(QThread):
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, symbol: str) -> None:
+        super().__init__()
+        self._symbol = symbol
+
+    def run(self) -> None:
+        try:
+            self.done.emit(load_profiles(self._symbol))
+        except MarketError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(str(exc) or "hacim profili alınamadı")
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -5360,6 +5466,8 @@ class MainWindow(QMainWindow):
         self._clip_worker: _ClipWorker | None = None
         self._clip_gen = 0
         self._liq_candle: tuple[str, int] | None = None
+        self._volume_worker: _VolumeWorker | None = None
+        self._volume_gen = 0
         saved_span = _read_state().get("liq_span")
         self._liq_span = int(saved_span) if saved_span in {hours for hours, _label in LIQ_SPANS} else 72
         saved_threshold = _read_state().get("liq_threshold")
@@ -6147,10 +6255,14 @@ class MainWindow(QMainWindow):
         self._page_group.setExclusive(True)
         self._page_market = QPushButton("Piyasa")
         self._page_liq = QPushButton("Likidasyon")
+        self._page_volume = QPushButton("Hacim")
+        self._page_limit = QPushButton("Limit")
         self._page_exchange = QPushButton("Borsa")
         for button, page, checked in (
             (self._page_market, "market", True),
             (self._page_liq, "liq", False),
+            (self._page_volume, "volume", False),
+            (self._page_limit, "limit", False),
             (self._page_exchange, "exchange", False),
         ):
             button.setObjectName("page")
@@ -6360,10 +6472,91 @@ class MainWindow(QMainWindow):
         self._right_stack = QStackedWidget()
         self._right_stack.addWidget(market_page)
         self._right_stack.addWidget(heat_page)
+        self._right_stack.addWidget(self._build_volume_page())
+        self._right_stack.addWidget(self._build_limit_page())
         self._right_stack.addWidget(self._build_exchange())
         self._right_stack.setCurrentIndex(0)
         column.addWidget(self._right_stack, 1)
         return panel
+
+    def _build_volume_page(self) -> QWidget:
+        page = QWidget()
+        page.setStyleSheet("background: #0b0b0d;")
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        self._volume_columns: list[_ProfileColumn] = []
+        for _index in range(3):
+            column = _ProfileColumn()
+            self._volume_columns.append(column)
+            layout.addWidget(column, 1)
+        self._volume_note = QLabel("")
+        self._volume_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._volume_note.setStyleSheet("color: #a1a1aa; font-size: 14px; background: transparent;")
+        self._volume_note.hide()
+        layout.addWidget(self._volume_note, 1)
+        self._volume_symbol = ""
+        return page
+
+    def _build_limit_page(self) -> QWidget:
+        page = QWidget()
+        page.setStyleSheet("background: #0b0b0d;")
+        layout = QVBoxLayout(page)
+        note = QLabel("Limit emir haritası sonra eklenecek")
+        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        note.setStyleSheet("color: #a1a1aa; font-size: 14px; background: transparent;")
+        layout.addWidget(note)
+        return page
+
+    def _show_volume_note(self, text: str) -> None:
+        shown = bool(text)
+        self._volume_note.setText(text)
+        self._volume_note.setVisible(shown)
+        for column in self._volume_columns:
+            column.setVisible(not shown)
+
+    def _ensure_volume(self) -> None:
+        if getattr(self, "_page", "") != "volume" or not hasattr(self, "_volume_columns"):
+            return
+        if is_index(self._symbol):
+            self._volume_symbol = ""
+            self._show_volume_note("Bu coin için hacim profili yok")
+            return
+        if self._volume_symbol != self._symbol:
+            self._volume_symbol = ""
+            for column in self._volume_columns:
+                column.set_profile(None)
+            self._show_volume_note("Yükleniyor")
+        if self._thread_running("_volume_worker"):
+            worker = self._volume_worker
+            if worker is not None and getattr(worker, "_symbol", None) == self._symbol:
+                return
+        self._volume_gen += 1
+        generation = self._volume_gen
+        symbol = self._symbol
+        worker = _VolumeWorker(symbol)
+        worker.done.connect(lambda payload, gen=generation, chosen=symbol: self._on_volume(gen, chosen, payload))
+        worker.failed.connect(lambda message, gen=generation, chosen=symbol: self._on_volume_fail(gen, chosen, message))
+        self._launch(worker, "_volume_worker")
+
+    def _on_volume(self, generation: int, symbol: str, profiles: object) -> None:
+        if generation != self._volume_gen or symbol != self._symbol or self._page != "volume":
+            return
+        if not isinstance(profiles, list):
+            return
+        self._volume_symbol = symbol
+        self._show_volume_note("")
+        for column, profile in zip(self._volume_columns, profiles):
+            column.set_profile(profile if isinstance(profile, VolumeProfile) else None)
+        for column in self._volume_columns[len(profiles):]:
+            column.set_profile(None)
+
+    def _on_volume_fail(self, generation: int, symbol: str, message: str) -> None:
+        if generation != self._volume_gen or symbol != self._symbol or self._page != "volume":
+            return
+        if self._volume_symbol == symbol:
+            return
+        self._show_volume_note(message or "hacim profili alınamadı")
 
     def _build_exchange(self) -> QWidget:
         data = _read_state()
@@ -6953,13 +7146,15 @@ class MainWindow(QMainWindow):
         if page == "liq" and is_index(self._symbol):
             self._page_market.setChecked(True)
             page = "market"
-        index = {"market": 0, "liq": 1, "exchange": 2}.get(page, 0)
+        index = {"market": 0, "liq": 1, "volume": 2, "limit": 3, "exchange": 4}.get(page, 0)
         self._page = page
         self._right_stack.setCurrentIndex(index)
         if hasattr(self, "_heat"):
             self._heat.set_live(page == "liq" and not self._background)
         if page == "liq":
             self._ensure_liquidity(False)
+        if page == "volume":
+            self._ensure_volume()
 
     def _stamp_liq_candle(self) -> None:
         """Aralık değişince bir sonraki kapanış beklenir. Yükleme bitince de aynı mum yazılır."""
@@ -7263,9 +7458,11 @@ class MainWindow(QMainWindow):
             self._history_done = True
             self.statusBar().showMessage(f"{index_label(symbol)} güncelleniyor")
             self._start_index(True)
+            self._ensure_volume()
             return
         self.statusBar().showMessage(f"{symbol} güncelleniyor")
         self._ensure_liquidity(True)
+        self._ensure_volume()
         self._refresh_okx_cap()
 
     def _set_interval(self, interval: str) -> None:
@@ -7716,6 +7913,8 @@ class MainWindow(QMainWindow):
         self._ensure_liquidity(False)
         if self._page == "liq":
             self._load_liq_candles()
+        if self._page == "volume":
+            self._ensure_volume()
 
     def _fill_windows(self, snapshot: Snapshot) -> None:
         self.analysis.setRowCount(len(snapshot.windows))
