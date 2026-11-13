@@ -93,10 +93,10 @@ class CvdPack:
         return total
 
 
-def load_cvd(symbol: str) -> CvdPack:
+def load_cvd(symbol: str, hour_only: bool = False) -> CvdPack:
     with _LOAD:
         try:
-            return _load(symbol)
+            return _load(symbol, hour_only)
         except Exception:
             return CvdPack(None, None, 0, 0, 0, 0)
 
@@ -126,6 +126,11 @@ def _path() -> str:
     return os.path.join(folder, "cvd_bars.json")
 
 
+def _book_has_bars(book: dict) -> bool:
+    fine = book.get("fine") or {}
+    return bool(fine.get("segments"))
+
+
 def _ensure_loaded() -> None:
     global _LOADED
     if _LOADED:
@@ -146,6 +151,10 @@ def _ensure_loaded() -> None:
         for key, book in books.items():
             if isinstance(book, dict):
                 _BOOKS[str(key)] = _book_in(book)
+    for key in list(_MISSING):
+        book = _BOOKS.get(key)
+        if isinstance(book, dict) and _book_has_bars(book):
+            _MISSING.discard(key)
 
 
 def _save() -> None:
@@ -349,6 +358,28 @@ def _kline_delta(row, volume_at: int, taker_at: int) -> tuple[int, float] | None
     return stamp, taker - (volume - taker)
 
 
+def _binance_hour(url: str, symbol: str, volume_at: int, taker_at: int) -> tuple[str, dict]:
+    status, payload = _get(url, {"symbol": symbol, "interval": "1h", "limit": 48})
+    if status == 0 or payload is None:
+        return "down", {}
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        if code in (-1121, -1122):
+            return "miss", {}
+        return "down", {}
+    if not isinstance(payload, list):
+        return "down", {}
+    points: dict[int, float] = {}
+    for row in payload:
+        pair = _kline_delta(row, volume_at, taker_at)
+        if pair is None:
+            continue
+        points[pair[0]] = pair[1]
+    if not points:
+        return "down", {}
+    return "ok", points
+
+
 def _binance_book(url: str, symbol: str, volume_at: int, taker_at: int, now: int) -> tuple[str, dict]:
     status, rows = _binance_rows(url, symbol, now)
     if status != "ok":
@@ -425,6 +456,18 @@ def _okx_spot(coin: str, period: str, step: int) -> tuple[str, dict[int, float]]
     return ("ok" if points else "down"), points
 
 
+def _fetch_binance_hour(kind: str, coin: str) -> tuple[str, dict]:
+    if kind == "perp-usdt":
+        return _binance_hour("https://fapi.binance.com/fapi/v1/klines", f"{coin}USDT", 5, 9)
+    if kind == "perp-usdc":
+        return _binance_hour("https://fapi.binance.com/fapi/v1/klines", f"{coin}USDC", 5, 9)
+    if kind == "perp-usd":
+        return _binance_hour("https://dapi.binance.com/dapi/v1/klines", f"{coin}USD_PERP", 7, 10)
+    if kind == "spot-usdt":
+        return _binance_hour("https://api.binance.com/api/v3/klines", f"{coin}USDT", 5, 9)
+    return _binance_hour("https://api.binance.com/api/v3/klines", f"{coin}USDC", 5, 9)
+
+
 def _fetch_binance(kind: str, coin: str, now: int) -> tuple[str, dict]:
     if kind == "perp-usdt":
         return _binance_book("https://fapi.binance.com/fapi/v1/klines", f"{coin}USDT", 5, 9, now)
@@ -437,18 +480,38 @@ def _fetch_binance(kind: str, coin: str, now: int) -> tuple[str, dict]:
     return _binance_book("https://api.binance.com/api/v3/klines", f"{coin}USDC", 5, 9, now)
 
 
-def _fetch_okx_perp(inst: str, book: dict, now: int) -> tuple[str, dict[int, float], dict[int, float]]:
-    fine_lo = _cursor(book["fine"]["segments"])
-    hour_lo = _cursor(book["hour"]["segments"])
-    fine_status, fine = _okx_contract(inst, "5m", FIVE_MS, 3, None if fine_lo is None else fine_lo)
+def _fetch_okx_perp(inst: str, book: dict, now: int, hour_only: bool = False) -> tuple[str, dict[int, float], dict[int, float]]:
+    if hour_only:
+        hour_status, hour = _okx_latest(inst, "1H", HOUR_MS, 2, book["hour"]["segments"])
+        if hour_status != "ok":
+            return hour_status, {}, {}
+        return "ok", {}, hour
+    fine_status, fine = _okx_latest(inst, "5m", FIVE_MS, 3, book["fine"]["segments"])
     if fine_status == "miss":
         return "miss", {}, {}
-    hour_status, hour = _okx_contract(inst, "1H", HOUR_MS, 2, None if hour_lo is None else hour_lo)
+    hour_status, hour = _okx_latest(inst, "1H", HOUR_MS, 2, book["hour"]["segments"])
     if hour_status == "miss" and fine_status != "ok":
         return "miss", {}, {}
     if fine_status != "ok" and hour_status != "ok":
         return "down", {}, {}
     return "ok", fine, hour
+
+
+def _okx_latest(inst: str, period: str, step: int, pages: int, segments: list[dict]) -> tuple[str, dict[int, float]]:
+    """Önce en yeni sayfa. Geriye yalnız taze veri ile kayıtlı seri arasında boşluk varsa inilir."""
+    status, points = _okx_contract(inst, period, step, pages, None)
+    if status != "ok" or not points:
+        return status, points
+    live = _live(segments)
+    if live is None:
+        return status, points
+    oldest = min(points)
+    if oldest <= int(live["hi"]):
+        return status, points
+    back_status, older = _okx_contract(inst, period, step, pages, oldest)
+    if back_status == "ok":
+        points.update(older)
+    return status, points
 
 
 def _cursor(segments: list[dict]) -> int | None:
@@ -508,6 +571,8 @@ def _bfx(symbol: str, book: dict, now: int) -> tuple[str, dict[int, float], bool
     rows: list[tuple[int, float]] = []
     status, latest = _bfx_page(symbol, None, None)
     if status != "ok":
+        if status == "miss" and _book_has_bars(book):
+            return "down", {}, False
         return status, {}, False
     rows.extend(_bfx_signed(latest))
     cursor = _cursor(book["fine"]["segments"])
@@ -799,7 +864,11 @@ def _iso_ms(text: str) -> int:
     return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() * 1000)
 
 
-def _one(side: str, name: str, coin: str, now: int) -> tuple[str, dict]:
+def _keeps_hour(name: str) -> bool:
+    return name.startswith("binance-") or name.startswith("okx-")
+
+
+def _one(side: str, name: str, coin: str, now: int, hour_only: bool = False) -> tuple[str, dict]:
     key = f"{side}:{name}:{coin}"
     with _LOCK:
         book = _BOOKS.get(key) or _empty_book(BAR_MS, HOUR_MS)
@@ -808,24 +877,41 @@ def _one(side: str, name: str, coin: str, now: int) -> tuple[str, dict]:
             "hour": {"step": book["hour"]["step"], "segments": [dict(item) for item in book["hour"]["segments"]]},
         }
     try:
-        update = _pull(side, name, coin, stored, now)
+        update = _pull(side, name, coin, stored, now, hour_only)
     except Exception:
+        update = ("down", {})
+    if hour_only and update[0] == "miss":
         update = ("down", {})
     return key, {"status": update[0], "body": update[1] if len(update) > 1 else {}}
 
 
-def _pull(side: str, name: str, coin: str, book: dict, now: int) -> tuple:
+def _pull(side: str, name: str, coin: str, book: dict, now: int, hour_only: bool = False) -> tuple:
     if name.startswith("binance-"):
         kind = f"{'perp' if side == 'perp' else 'spot'}-{name.split('-', 1)[1]}"
+        if hour_only:
+            status, hour = _fetch_binance_hour(kind, coin)
+            return status, {
+                "fine": {},
+                "hour": hour,
+                "fine_step": BAR_MS,
+                "hour_step": HOUR_MS,
+                "replace": False,
+                "exhaust": None,
+            }
         status, fine = _fetch_binance(kind, coin, now)
         return status, {"fine": fine, "hour": {}, "fine_step": BAR_MS, "hour_step": HOUR_MS, "replace": True, "exhaust": None}
     if side == "perp" and name == "okx-usdt":
-        status, fine, hour = _fetch_okx_perp(f"{coin}-USDT-SWAP", book, now)
+        status, fine, hour = _fetch_okx_perp(f"{coin}-USDT-SWAP", book, now, hour_only)
         return status, {"fine": fine, "hour": hour, "fine_step": FIVE_MS, "hour_step": HOUR_MS, "replace": False, "exhaust": None}
     if side == "perp" and name == "okx-usd":
-        status, fine, hour = _fetch_okx_perp(f"{coin}-USD-SWAP", book, now)
+        status, fine, hour = _fetch_okx_perp(f"{coin}-USD-SWAP", book, now, hour_only)
         return status, {"fine": fine, "hour": hour, "fine_step": FIVE_MS, "hour_step": HOUR_MS, "replace": False, "exhaust": None}
     if side == "spot" and name == "okx-usdt":
+        if hour_only:
+            hour_status, hour = _okx_spot(coin, "1H", HOUR_MS)
+            if hour_status != "ok":
+                return hour_status, {}
+            return "ok", {"fine": {}, "hour": hour, "fine_step": FIVE_MS, "hour_step": HOUR_MS, "replace": False, "exhaust": None}
         fine_status, fine = _okx_spot(coin, "5m", FIVE_MS)
         hour_status, hour = _okx_spot(coin, "1H", HOUR_MS)
         if fine_status == "miss" and hour_status == "miss":
@@ -898,7 +984,7 @@ def _venue_of(book: dict) -> Venue:
     )
 
 
-def _load(symbol: str) -> CvdPack:
+def _load(symbol: str, hour_only: bool = False) -> CvdPack:
     coin = _coin(symbol)
     now = int(time.time() * 1000)
     with _LOCK:
@@ -906,13 +992,15 @@ def _load(symbol: str) -> CvdPack:
         jobs = []
         for side, names in (("perp", PERP), ("spot", SPOT)):
             for name in names:
+                if hour_only and not _keeps_hour(name):
+                    continue
                 if f"{side}:{name}:{coin}" in _MISSING:
                     continue
                 jobs.append((side, name))
     fresh: dict[str, dict] = {}
     if jobs:
         with ThreadPoolExecutor(max_workers=8) as pool:
-            running = {pool.submit(_one, side, name, coin, now): (side, name) for side, name in jobs}
+            running = {pool.submit(_one, side, name, coin, now, hour_only): (side, name) for side, name in jobs}
             for job in running:
                 try:
                     key, payload = job.result()

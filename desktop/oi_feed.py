@@ -150,10 +150,10 @@ def _at(bucket: dict[int, float], stamp: int, bar_ms: int) -> float | None:
     return None
 
 
-def load_oi(symbol: str) -> OiPack:
+def load_oi(symbol: str, hour_only: bool = False) -> OiPack:
     coin = coin_of(symbol)
     try:
-        pack = _load(coin)
+        pack = _load(coin, hour_only)
     except Exception:
         pack = None
     with _LOCK:
@@ -163,14 +163,15 @@ def load_oi(symbol: str) -> OiPack:
         return _PACKS.get(coin) or OiPack({}, None, 0, 0)
 
 
-def _load(coin: str) -> OiPack:
+def _load(coin: str, hour_only: bool = False) -> OiPack:
     _load_samples()
     now = int(time.time() * 1000)
+    periods = tuple(period for period in PERIODS if not (hour_only and period == "15m"))
     jobs: list[tuple[str, str]] = []
     with _LOCK:
         due = [
             period
-            for period in PERIODS
+            for period in periods
             if _BUCKET.get((coin, period)) != now // BAR_MS[period] or (coin, period) not in _MERGED
         ]
     for period in due:
@@ -191,7 +192,7 @@ def _load(coin: str) -> OiPack:
                     fresh[(name, period)] = ("down", [])
     series: dict[str, list[Point]] = {}
     with _LOCK:
-        for period in PERIODS:
+        for period in periods:
             bar = BAR_MS[period]
             if period not in due and (coin, period) in _MERGED:
                 series[period] = list(_MERGED[(coin, period)])
@@ -240,11 +241,13 @@ def _load(coin: str) -> OiPack:
                 _NAMES[(coin, period)] = names
                 _COUNTS[(coin, period)] = (period_up, period_known)
             series[period] = list(_MERGED.get((coin, period)) or [])
+        if hour_only and (coin, "15m") in _MERGED:
+            series["15m"] = list(_MERGED[(coin, "15m")])
         used = list(_NAMES.get((coin, "15m")) or [])
         counted = _COUNTS.get((coin, "15m")) or (0, 0)
     live, live_up, live_known = _cached_live(coin, used, now)
     _save_samples()
-    if live is not None and series.get("15m"):
+    if not hour_only and live is not None and series.get("15m"):
         bar = BAR_MS["15m"]
         stamp = now // bar * bar
         closed = [point for point in series["15m"] if point.time_ms < stamp]

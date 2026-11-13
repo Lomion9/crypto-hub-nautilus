@@ -708,6 +708,7 @@ def load_snapshot(
     chart_interval: str = "15m",
     with_chart: bool = True,
     enabled: set[str] | None = None,
+    tray: bool = False,
 ) -> Snapshot:
     symbol = symbol.upper().strip()
     if chart_interval not in CHART_INTERVALS:
@@ -716,18 +717,24 @@ def load_snapshot(
     warning = None
     wanted = [row for row in ANALYSIS if row[0] != "15dk" and (enabled is None or row[0] in enabled)]
     with ThreadPoolExecutor(max_workers=8) as pool:
-        if with_chart and chart_interval == "15m":
+        fut_spot = None
+        if tray:
+            fut_perp = None
+            fut_chart = None
+        elif with_chart and chart_interval == "15m":
             fut_chart = pool.submit(cached_klines, symbol, "15m", True, CHART_BARS, True)
             fut_perp = None
         else:
             fut_perp = pool.submit(cached_klines, symbol, "15m", True, HISTORY_BARS, True)
             fut_chart = pool.submit(cached_klines, symbol, chart_interval, True, CHART_BARS) if with_chart else None
-        fut_spot = pool.submit(cached_klines, symbol, "15m", False, HISTORY_BARS)
+            fut_spot = pool.submit(cached_klines, symbol, "15m", False, HISTORY_BARS)
+        if not tray and fut_spot is None:
+            fut_spot = pool.submit(cached_klines, symbol, "15m", False, HISTORY_BARS)
         from desktop.oi_feed import load_oi
         from desktop.cvd_feed import load_cvd
 
-        fut_oi = pool.submit(load_oi, symbol)
-        fut_cvd = pool.submit(load_cvd, symbol)
+        fut_oi = pool.submit(load_oi, symbol, tray)
+        fut_cvd = pool.submit(load_cvd, symbol, tray)
         fut_live = pool.submit(_live, symbol)
         extra = {
             label: (
@@ -737,7 +744,10 @@ def load_snapshot(
             for label, interval, bar_ms in wanted
         }
         try:
-            if fut_perp is None and fut_chart is not None:
+            if tray:
+                perp = []
+                chart_bars = []
+            elif fut_perp is None and fut_chart is not None:
                 chart_bars = list(fut_chart.result())[-CHART_BARS:]
                 perp = chart_bars[-HISTORY_BARS:]
             else:
@@ -745,7 +755,7 @@ def load_snapshot(
                 chart_bars = list(fut_chart.result())[-CHART_BARS:] if fut_chart is not None else []
         except MarketError as exc:
             raise MarketError(str(exc)) from exc
-        spot = fut_spot.result()
+        spot = [] if fut_spot is None else fut_spot.result()
         oi_pack = fut_oi.result()
         oi_points = list(oi_pack.series.get("15m") or [])
         from desktop.funding_feed import load_funding
@@ -764,15 +774,30 @@ def load_snapshot(
             for label, (perp_f, spot_f) in extra.items()
         }
 
-    if not perp:
-        raise MarketError(f"{symbol} mum verisi boş")
-    if with_chart and not chart_bars:
-        chart_bars = perp
-        warning = f"{chart_interval} grafiği alınamadı, 15dk gösteriliyor"
-
-    price = chart_bars[-1].close if chart_bars else mark
-    if price is None:
-        price = perp[-1].close
+    if tray:
+        price = None
+        hour = fetched.get("1sa")
+        if hour and hour[0]:
+            price = hour[0][-1].close
+        if price is None:
+            for label, _interval, _bar_ms in wanted:
+                bars = fetched[label][0]
+                if bars:
+                    price = bars[-1].close
+                    break
+        if price is None:
+            price = mark
+        if price is None:
+            raise MarketError(f"{symbol} mum verisi boş")
+    else:
+        if not perp:
+            raise MarketError(f"{symbol} mum verisi boş")
+        if with_chart and not chart_bars:
+            chart_bars = perp
+            warning = f"{chart_interval} grafiği alınamadı, 15dk gösteriliyor"
+        price = chart_bars[-1].close if chart_bars else mark
+        if price is None and perp:
+            price = perp[-1].close
     oi_base = oi_pack.live
     if oi_base is None and oi_points:
         oi_base = oi_points[-1].value
@@ -784,6 +809,8 @@ def load_snapshot(
         if enabled is not None and label not in enabled:
             continue
         if label == "15dk":
+            if tray:
+                continue
             series_perp, series_spot, series_oi = list(perp), list(spot), list(oi_points)
             if series_perp and series_perp[-1].time_ms + bar_ms > now_ms and mark is not None:
                 last = series_perp[-1]

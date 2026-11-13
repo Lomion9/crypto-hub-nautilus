@@ -109,7 +109,7 @@ from desktop.format import (
     format_quantity,
     format_usd,
 )
-from desktop.volume_profile import VolumeProfile, load_profiles
+from desktop.volume_profile import VOLUME_RANGES, VolumeProfile, load_profile, signal_stop_level
 from desktop.market import (
     CHART_BARS,
     CHART_INTERVALS,
@@ -1689,12 +1689,14 @@ class SnapshotWorker(QThread):
         with_chart: bool = True,
         enabled: set[str] | None = None,
         episodes: dict | None = None,
+        tray: bool = False,
     ) -> None:
         super().__init__()
         self._symbol = symbol
         self._interval = interval
         self._with_chart = with_chart
         self._enabled = None if enabled is None else set(enabled)
+        self._tray = tray
         self._episodes = {
             label: dict(episode) if isinstance(episode, dict) else episode
             for label, episode in (episodes or {}).items()
@@ -1707,8 +1709,9 @@ class SnapshotWorker(QThread):
                 self._interval,
                 with_chart=self._with_chart,
                 enabled=self._enabled,
+                tray=self._tray,
             )
-            touches = _episode_touch(self._symbol, self._episodes) if self._episodes else {}
+            touches = {} if self._tray or not self._episodes else _episode_touch(self._symbol, self._episodes)
             self.done.emit(replace(snapshot, touches=touches))
         except MarketError as exc:
             self.failed.emit(str(exc))
@@ -3675,23 +3678,30 @@ def _episode_text(snapshot: Snapshot, event: _SignalEvent, window) -> str:
     elif event.kind == "sure":
         head = f"{event.verdict} süresi doldu"
     else:
-        head = f"Yeni · {event.verdict}"
-    hedef = "Hedef fiyat yok" if event.target is None else f"Hedef fiyat {format_price(event.target)}"
+        head = event.verdict
     tp = _take_profit(_trade_side(event.verdict), event.target)
-    hedef = f"{hedef}\n{'Take profit yok' if tp is None else f'Take profit {_format_tp(tp)}'}"
-    price = format_percent(None if window is None else window.price_pct)
-    oi = format_percent(None if window is None else window.oi_pct)
-    perp = format_amount(None if window is None else window.cvd_perp)
-    spot = format_amount(None if window is None else window.cvd_spot)
-    funding = format_funding(snapshot.funding_percent)
-    return (
-        f"{snapshot.symbol} · {event.label}\n"
-        f"{head}\n"
-        f"{hedef}\n"
-        f"Fiyat {price} · OI {oi}\n"
-        f"Funding {funding} · {snapshot.funding_status}\n"
-        f"CVD perp {perp} · CVD spot {spot}"
+    lines = [
+        f"{snapshot.symbol} · {event.label}",
+        head,
+        "Take profit yok" if tp is None else f"Take profit {_format_tp(tp)}",
+        "Hedef fiyat yok" if event.target is None else f"Hedef fiyat {format_price(event.target)}",
+    ]
+    if event.kind != "yeni":
+        return "\n".join(lines)
+    opened = None if window is None else window.closed_ms
+    bar_ms = SIGNAL_BAR_MS.get(event.label, 0)
+    close_ms = int(opened) + bar_ms if isinstance(opened, (int, float)) and float(opened) > 0 and bar_ms else int(time.time() * 1000)
+    found, level = signal_stop_level(
+        snapshot.symbol,
+        event.label,
+        close_ms,
+        snapshot.price,
+        _trade_side(event.verdict),
     )
+    if not found:
+        return "\n".join(lines)
+    lines.append("Stop loss yok" if level is None else f"Stop loss {format_price(level)}")
+    return "\n".join(lines)
 
 
 def _signal_text(snapshot: Snapshot, label: str, verdict: str, window) -> str:
@@ -4004,6 +4014,18 @@ class _SignalEvent:
         self.target = target
 
 
+def _tp_stays_beyond(side: str | None, level, price) -> bool:
+    """Short take profit fiyatın altında, long take profit fiyatın üstünde kalır."""
+    tp = _take_profit(side, level)
+    if tp is None or not isinstance(price, (int, float)) or float(price) <= 0:
+        return False
+    if side == "down":
+        return tp < float(price)
+    if side == "up":
+        return tp > float(price)
+    return False
+
+
 def _take_profit(side: str | None, target) -> float | None:
     """Long hedefin 200$ altı, short hedefin 200$ üstü."""
     if side not in ("up", "down"):
@@ -4302,15 +4324,16 @@ def _advance_signal(
             kept["candle"] = closed_ms
             kept["quiet"] = False
             stored = kept.get("target")
-            if not isinstance(stored, (int, float)) or stored <= 0:
+            kept["side"] = kept.get("side") or _trade_side(verdict)
+            anchor = kept.get("entry") if isinstance(kept.get("entry"), (int, float)) and float(kept.get("entry") or 0) > 0 else spot
+            if not isinstance(stored, (int, float)) or stored <= 0 or not _tp_stays_beyond(kept.get("side"), stored, anchor):
                 stored = targets.get(label)
                 kept["target"] = stored
-                kept["side"] = _trade_side(verdict)
                 kept["tp"] = _take_profit(kept.get("side"), stored)
                 if not isinstance(kept.get("entry"), (int, float)):
                     kept["entry"] = float(spot) if isinstance(spot, (int, float)) and float(spot) > 0 else None
             elif not isinstance(kept.get("tp"), (int, float)) or float(kept.get("tp") or 0) <= 0:
-                kept["tp"] = _take_profit(kept.get("side") or _trade_side(verdict), stored)
+                kept["tp"] = _take_profit(kept.get("side"), stored)
             events.append(
                 _SignalEvent(label, "devam", verdict, float(stored) if isinstance(stored, (int, float)) else None)
             )
@@ -4325,7 +4348,8 @@ def _advance_signal(
             kept["quiet"] = False
             kept["candle"] = closed_ms
             kept["side"] = new_side
-            if isinstance(target, (int, float)) and float(target) > 0:
+            anchor = kept.get("entry") if isinstance(kept.get("entry"), (int, float)) and float(kept.get("entry") or 0) > 0 else spot
+            if isinstance(target, (int, float)) and _tp_stays_beyond(new_side, target, anchor):
                 kept["target"] = float(target)
                 kept["tp"] = _take_profit(new_side, target)
             shown = kept.get("target")
@@ -5248,26 +5272,21 @@ class _TargetTable:
         spot = price if isinstance(price, (int, float)) and price > 0 else (shown.closes[-1] if shown.closes else 0)
         if spot <= 0:
             return None
-        fallback = self.top[0][0] if self.top else None
         for level, _usd in self.top:
-            if side == "up" and level <= spot:
-                continue
-            if side == "down" and level >= spot:
+            if not _tp_stays_beyond(side, level, spot):
                 continue
             return level
         if self.complete:
-            return fallback
+            return None
         best: float | None = None
         best_usd = 0.0
         for level, usd in self._entries():
-            if side == "up" and level <= spot:
-                continue
-            if side == "down" and level >= spot:
+            if not _tp_stays_beyond(side, level, spot):
                 continue
             if best is None or usd > best_usd:
                 best_usd = usd
                 best = level
-        return best if best is not None else fallback
+        return best
 
 
 def _clip_set(book: LiquidityMap, spans: set[int], target_hours: set[int], conserved: bool) -> tuple[dict, dict]:
@@ -5340,66 +5359,155 @@ class _LiqCandleWorker(QThread):
         self.done.emit(bars)
 
 
-class _ProfileColumn(QWidget):
-    """Bir seansın hacim profili. POC, değer alanı, tepe ve çukur."""
+_TSI = timezone(timedelta(hours=3))
+
+
+def _tsi_clock(stamp_ms: int) -> str:
+    moment = datetime.fromtimestamp(stamp_ms / 1000, _TSI)
+    if moment.hour == 0 and moment.minute == 0:
+        return "24:00"
+    return f"{moment:%H:%M}"
+
+
+class _VolumeBoard(QWidget):
+    """Seans histogramları tek fiyat cetvelinde. Çubuklar sağdan sola büyür."""
 
     def __init__(self) -> None:
         super().__init__()
-        self._profile: VolumeProfile | None = None
-        self.setMinimumWidth(200)
+        self._profiles: list[VolumeProfile] = []
+        self._message = ""
+        self._price: float | None = None
+        self._rising = True
+        self.setMinimumHeight(280)
 
-    def set_profile(self, profile: VolumeProfile | None) -> None:
-        self._profile = profile
+    def set_profiles(self, profiles: list[VolumeProfile]) -> None:
+        self._profiles = list(profiles)
+        self._message = ""
+        self.update()
+
+    def set_message(self, text: str) -> None:
+        self._message = text
+        if text:
+            self._profiles = []
+        self.update()
+
+    def set_last(self, price: float | None, rising: bool) -> None:
+        self._price = None if price is None else float(price)
+        self._rising = bool(rising)
         self.update()
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#0b0b0d"))
-        profile = self._profile
-        if profile is None:
+        if self._message and not self._profiles:
+            painter.setPen(MUTED)
+            painter.setFont(QFont("Segoe UI", 13))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._message)
+            painter.end()
             return
-        painter.setPen(QColor("#fafafa"))
-        painter.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
-        title = profile.name + (" · sürüyor" if profile.developing else " · kapandı" if not profile.note else "")
-        painter.drawText(QRectF(12, 8, self.width() - 24, 22), Qt.AlignmentFlag.AlignLeft, title)
-        start = datetime.fromtimestamp(profile.start_ms / 1000, timezone.utc)
-        end = datetime.fromtimestamp(profile.end_ms / 1000, timezone.utc)
-        end_text = "24:00" if end.hour == 0 and end.minute == 0 else f"{end:%H:%M}"
-        painter.setPen(QColor("#a1a1aa"))
-        painter.setFont(QFont("Consolas", 9))
-        painter.drawText(
-            QRectF(12, 30, self.width() - 24, 16),
-            Qt.AlignmentFlag.AlignLeft,
-            f"{start:%H:%M}–{end_text} UTC",
-        )
-        if profile.note or not profile.rows:
-            painter.drawText(QRectF(12, 64, self.width() - 24, 24), Qt.AlignmentFlag.AlignLeft, profile.note or "veri yok")
+        profiles = self._profiles
+        if not profiles:
+            painter.end()
             return
-        top = 58.0
-        bottom = float(self.height() - 16)
-        left = 78.0
-        right = float(self.width() - 14)
-        if bottom - top < 40 or right - left < 20:
+        axis_w = 84.0
+        margin = 8.0
+        header_h = 48.0
+        plot = QRectF(margin, header_h, max(1.0, self.width() - margin * 2 - axis_w), max(1.0, self.height() - header_h - 10))
+        if plot.width() < 40 or plot.height() < 40:
+            painter.end()
             return
-        high = profile.rows[-1].high
-        low = profile.rows[0].low
+        low, high = self._span(profiles)
+        if low is None or high is None:
+            for index, profile in enumerate(profiles):
+                left = margin + index * ((self.width() - margin * 2) / max(len(profiles), 1))
+                width = (self.width() - margin * 2) / max(len(profiles), 1)
+                self._paint_column(painter, profile, QRectF(left, header_h, max(1.0, width - 10), 40), lambda _price: header_h)
+            painter.end()
+            return
         span = high - low
-        if span <= 0:
-            return
-        widest = max(row.total for row in profile.rows) or 1.0
 
         def y_of(price: float) -> float:
-            return top + (high - price) / span * (bottom - top)
+            return plot.top() + (high - price) / span * plot.height()
 
+        painter.fillRect(QRectF(plot.right(), plot.top(), axis_w + margin, plot.height()), QColor("#18181b"))
+        painter.setPen(QPen(QColor("#27272a"), 1))
+        step = _tick_step(span)
+        tick = math.ceil(low / step - 1e-9) * step
+        guard = 0
+        while tick <= high + step * 1e-9 and guard < 24:
+            y = y_of(tick)
+            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
+            tick += step
+            guard += 1
+        count = len(profiles)
+        gap = 10.0
+        col_w = (plot.width() - gap * (count - 1)) / count
+        for index, profile in enumerate(profiles):
+            left = plot.left() + index * (col_w + gap)
+            self._paint_column(painter, profile, QRectF(left, plot.top(), col_w, plot.height()), y_of)
+        painter.setPen(MUTED)
+        painter.setFont(QFont("Consolas", 8))
+        tick = math.ceil(low / step - 1e-9) * step
+        guard = 0
+        while tick <= high + step * 1e-9 and guard < 24:
+            y = y_of(tick)
+            painter.drawText(QRectF(plot.right() + 6, y - 8, axis_w - 10, 16), Qt.AlignmentFlag.AlignLeft, format_price(tick))
+            tick += step
+            guard += 1
+        self._paint_last(painter, plot, y_of)
+        painter.end()
+
+    def _span(self, profiles: list[VolumeProfile]) -> tuple[float | None, float | None]:
+        lows: list[float] = []
+        highs: list[float] = []
+        for profile in profiles:
+            if not profile.rows:
+                continue
+            lows.append(profile.rows[0].low)
+            highs.append(profile.rows[-1].high)
+        if self._price is not None:
+            lows.append(self._price)
+            highs.append(self._price)
+        if not lows:
+            return None, None
+        low = min(lows)
+        high = max(highs)
+        pad = (high - low) * 0.04 if high > low else max(abs(low) * 0.01, 1.0)
+        return low - pad, high + pad
+
+    def _paint_column(self, painter: QPainter, profile: VolumeProfile, column: QRectF, y_of) -> None:
+        title = profile.name
+        if profile.developing:
+            title += " · sürüyor"
+        elif not profile.note:
+            title += " · kapandı"
+        painter.setPen(QColor("#fafafa"))
+        painter.setFont(QFont("Segoe UI", 11, QFont.Weight.DemiBold))
+        shown_title = painter.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, int(column.width()))
+        painter.drawText(QRectF(column.left(), 6, column.width(), 20), Qt.AlignmentFlag.AlignLeft, shown_title)
+        clock = f"{_tsi_clock(profile.start_ms)}–{_tsi_clock(profile.end_ms)} TSI (UTC+3)"
+        painter.setPen(MUTED)
+        painter.setFont(QFont("Consolas", 8))
+        shown = painter.fontMetrics().elidedText(clock, Qt.TextElideMode.ElideRight, int(column.width()))
+        painter.drawText(QRectF(column.left(), 26, column.width(), 16), Qt.AlignmentFlag.AlignLeft, shown)
+        if profile.note or not profile.rows:
+            painter.drawText(
+                QRectF(column.left(), column.top() + 12, column.width(), 24),
+                Qt.AlignmentFlag.AlignLeft,
+                profile.note or "veri yok",
+            )
+            return
         if profile.val is not None and profile.vah is not None:
             band_top = y_of(profile.vah)
             band_bottom = y_of(profile.val)
-            painter.fillRect(QRectF(left, band_top, right - left, band_bottom - band_top), QColor(41, 98, 255, 28))
+            painter.fillRect(QRectF(column.left(), band_top, column.width(), band_bottom - band_top), QColor(41, 98, 255, 28))
+        widest = max(row.total for row in profile.rows) or 1.0
+        right = column.right()
         for row in profile.rows:
             y1 = y_of(row.high)
             y2 = y_of(row.low)
             height = max(1.0, y2 - y1 - 1.0)
-            width = (row.total / widest) * (right - left) if row.total > 0 else 0.0
+            width = (row.total / widest) * column.width() * (2.0 / 3.0) if row.total > 0 else 0.0
             inside = (
                 profile.val is not None
                 and profile.vah is not None
@@ -5409,11 +5517,15 @@ class _ProfileColumn(QWidget):
             up_color = QColor("#60a5fa") if inside else QColor("#3f3f46")
             down_color = QColor("#f5c451") if inside else QColor("#71717a")
             up_width = width * (row.up / row.total) if row.total else 0.0
-            painter.fillRect(QRectF(left, y1, up_width, height), up_color)
-            painter.fillRect(QRectF(left + up_width, y1, max(0.0, width - up_width), height), down_color)
-            if row.kind:
-                painter.setPen(QColor("#93c5fd") if row.kind == "tepe" else QColor("#d4d4d8"))
-                painter.drawText(QRectF(left + width + 4, y1 - 2, 48, height + 4), Qt.AlignmentFlag.AlignLeft, row.kind)
+            painter.fillRect(QRectF(right - up_width, y1, up_width, height), up_color)
+            painter.fillRect(QRectF(right - width, y1, max(0.0, width - up_width), height), down_color)
+            if row.kind and column.width() - width >= 36:
+                painter.setPen(QColor("#93c5fd") if row.kind == "HVN" else QColor("#d4d4d8"))
+                painter.drawText(
+                    QRectF(column.left(), y1 - 2, max(0.0, column.width() - width - 4), height + 4),
+                    Qt.AlignmentFlag.AlignRight,
+                    row.kind,
+                )
         painter.setFont(QFont("Consolas", 8))
         for price, label, color in (
             (profile.vah, "VAH", "#60a5fa"),
@@ -5424,21 +5536,41 @@ class _ProfileColumn(QWidget):
                 continue
             y = y_of(price)
             painter.setPen(QColor(color))
-            painter.drawLine(int(left), int(y), int(right), int(y))
-            painter.drawText(QRectF(8, y - 8, left - 12, 16), Qt.AlignmentFlag.AlignRight, f"{label} {format_price(price)}")
+            painter.drawLine(QPointF(column.left(), y), QPointF(column.right(), y))
+            painter.drawText(QRectF(column.left() + 2, y - 14, 36, 14), Qt.AlignmentFlag.AlignLeft, label)
+
+    def _paint_last(self, painter: QPainter, plot: QRectF, y_of) -> None:
+        if self._price is None:
+            return
+        y = y_of(self._price)
+        if y < plot.top() - 1 or y > plot.bottom() + 1:
+            return
+        color = UP if self._rising else DOWN
+        pen = QPen(color)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.PenStyle.CustomDashLine)
+        pen.setDashPattern([4, 3])
+        painter.setPen(pen)
+        painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
+        rect = QRectF(plot.right() + 4, y - 9, 76, 18)
+        painter.fillRect(rect, color)
+        painter.setPen(QColor("#0b0b0d"))
+        painter.setFont(QFont("Consolas", 8))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, format_price(self._price))
 
 
 class _VolumeWorker(QThread):
     done = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, symbol: str) -> None:
+    def __init__(self, symbol: str, span: str) -> None:
         super().__init__()
         self._symbol = symbol
+        self._span = span
 
     def run(self) -> None:
         try:
-            self.done.emit(load_profiles(self._symbol))
+            self.done.emit(load_profile(self._symbol, self._span))
         except MarketError as exc:
             self.failed.emit(str(exc))
         except Exception as exc:
@@ -5468,6 +5600,8 @@ class MainWindow(QMainWindow):
         self._liq_candle: tuple[str, int] | None = None
         self._volume_worker: _VolumeWorker | None = None
         self._volume_gen = 0
+        saved_volume = _read_state().get("volume_range")
+        self._volume_range = saved_volume if saved_volume in {key for key, _label in VOLUME_RANGES} else "gunluk"
         saved_span = _read_state().get("liq_span")
         self._liq_span = int(saved_span) if saved_span in {hours for hours, _label in LIQ_SPANS} else 72
         saved_threshold = _read_state().get("liq_threshold")
@@ -5521,6 +5655,8 @@ class MainWindow(QMainWindow):
         self._drawings = _load_drawings()
         self._last_trades: dict[str, float] = {}
         self._background = False
+        self._tray_hour_id: int | None = None
+        self._tray_snap_gen: int | None = None
         self._page = "market"
         self._quitting = False
         self._live_price: float | None = None
@@ -6482,20 +6618,26 @@ class MainWindow(QMainWindow):
     def _build_volume_page(self) -> QWidget:
         page = QWidget()
         page.setStyleSheet("background: #0b0b0d;")
-        layout = QHBoxLayout(page)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
-        self._volume_columns: list[_ProfileColumn] = []
-        for _index in range(3):
-            column = _ProfileColumn()
-            self._volume_columns.append(column)
-            layout.addWidget(column, 1)
-        self._volume_note = QLabel("")
-        self._volume_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._volume_note.setStyleSheet("color: #a1a1aa; font-size: 14px; background: transparent;")
-        self._volume_note.hide()
-        layout.addWidget(self._volume_note, 1)
-        self._volume_symbol = ""
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        bar = QHBoxLayout()
+        bar.setContentsMargins(8, 8, 8, 0)
+        bar.addStretch(1)
+        self._volume_range_box = QComboBox()
+        self._volume_range_box.setMinimumWidth(120)
+        for key, label in VOLUME_RANGES:
+            self._volume_range_box.addItem(label, key)
+        current = next((index for index, (key, _label) in enumerate(VOLUME_RANGES) if key == self._volume_range), 3)
+        self._volume_range_box.blockSignals(True)
+        self._volume_range_box.setCurrentIndex(current)
+        self._volume_range_box.blockSignals(False)
+        self._volume_range_box.currentIndexChanged.connect(self._on_volume_range)
+        bar.addWidget(self._volume_range_box, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(bar)
+        self._volume_board = _VolumeBoard()
+        layout.addWidget(self._volume_board, 1)
+        self._volume_shown = ("", "")
         return page
 
     def _build_limit_page(self) -> QWidget:
@@ -6509,52 +6651,71 @@ class MainWindow(QMainWindow):
         return page
 
     def _show_volume_note(self, text: str) -> None:
-        shown = bool(text)
-        self._volume_note.setText(text)
-        self._volume_note.setVisible(shown)
-        for column in self._volume_columns:
-            column.setVisible(not shown)
+        self._volume_board.set_message(text)
+
+    def _sync_volume_price(self, price: float | None = None, rising: bool | None = None, *, clear: bool = False) -> None:
+        board = getattr(self, "_volume_board", None)
+        if board is None:
+            return
+        if clear:
+            board.set_last(None, True)
+            return
+        if price is None:
+            price = self._live_price if self._live_price is not None else board._price
+        if price is None:
+            return
+        board.set_last(price, self._live_up if rising is None else rising)
+
+    def _on_volume_range(self, _index: int) -> None:
+        key = str(self._volume_range_box.currentData() or "")
+        if key not in {item for item, _label in VOLUME_RANGES} or key == self._volume_range:
+            return
+        self._volume_range = key
+        _patch_state(volume_range=key)
+        self._ensure_volume()
 
     def _ensure_volume(self) -> None:
-        if getattr(self, "_page", "") != "volume" or not hasattr(self, "_volume_columns"):
+        if self._background:
+            return
+        if getattr(self, "_page", "") != "volume" or not hasattr(self, "_volume_board"):
             return
         if is_index(self._symbol):
-            self._volume_symbol = ""
+            self._volume_shown = ("", "")
             self._show_volume_note("Bu coin için hacim profili yok")
             return
-        if self._volume_symbol != self._symbol:
-            self._volume_symbol = ""
-            for column in self._volume_columns:
-                column.set_profile(None)
+        span = self._volume_range
+        if self._volume_shown != (self._symbol, span):
             self._show_volume_note("Yükleniyor")
         if self._thread_running("_volume_worker"):
             worker = self._volume_worker
-            if worker is not None and getattr(worker, "_symbol", None) == self._symbol:
+            if worker is not None and getattr(worker, "_symbol", None) == self._symbol and getattr(worker, "_span", None) == span:
                 return
         self._volume_gen += 1
         generation = self._volume_gen
         symbol = self._symbol
-        worker = _VolumeWorker(symbol)
-        worker.done.connect(lambda payload, gen=generation, chosen=symbol: self._on_volume(gen, chosen, payload))
-        worker.failed.connect(lambda message, gen=generation, chosen=symbol: self._on_volume_fail(gen, chosen, message))
+        worker = _VolumeWorker(symbol, span)
+        worker.done.connect(
+            lambda payload, gen=generation, chosen=symbol, picked=span: self._on_volume(gen, chosen, picked, payload)
+        )
+        worker.failed.connect(
+            lambda message, gen=generation, chosen=symbol, picked=span: self._on_volume_fail(gen, chosen, picked, message)
+        )
         self._launch(worker, "_volume_worker")
 
-    def _on_volume(self, generation: int, symbol: str, profiles: object) -> None:
-        if generation != self._volume_gen or symbol != self._symbol or self._page != "volume":
+    def _on_volume(self, generation: int, symbol: str, span: str, profile: object) -> None:
+        if generation != self._volume_gen or symbol != self._symbol or span != self._volume_range or self._page != "volume":
             return
-        if not isinstance(profiles, list):
+        if not isinstance(profile, VolumeProfile):
+            self._show_volume_note("veri yok")
             return
-        self._volume_symbol = symbol
-        self._show_volume_note("")
-        for column, profile in zip(self._volume_columns, profiles):
-            column.set_profile(profile if isinstance(profile, VolumeProfile) else None)
-        for column in self._volume_columns[len(profiles):]:
-            column.set_profile(None)
+        self._volume_shown = (symbol, span)
+        self._volume_board.set_profiles([profile])
+        self._sync_volume_price()
 
-    def _on_volume_fail(self, generation: int, symbol: str, message: str) -> None:
-        if generation != self._volume_gen or symbol != self._symbol or self._page != "volume":
+    def _on_volume_fail(self, generation: int, symbol: str, span: str, message: str) -> None:
+        if generation != self._volume_gen or symbol != self._symbol or span != self._volume_range or self._page != "volume":
             return
-        if self._volume_symbol == symbol:
+        if self._volume_shown == (symbol, span):
             return
         self._show_volume_note(message or "hacim profili alınamadı")
 
@@ -7423,6 +7584,7 @@ class MainWindow(QMainWindow):
     def _show_symbol(self, symbol: str) -> None:
         self._live_price = None
         self._live_set = None
+        self._sync_volume_price(clear=True)
         self._limit_edited = False
         if hasattr(self, "_okx_limit"):
             self._okx_limit.clear()
@@ -7507,10 +7669,13 @@ class MainWindow(QMainWindow):
         if self._quitting:
             return
         self._background = True
+        self._tray_hour_id = int(time.time() * 1000) // HOUR_MS
         if hasattr(self, "_heat"):
             self._heat.set_live(False)
         self._timer.setInterval(BACKGROUND_MS)
         self._sync_feed()
+        if not _read_state().get("okx_enabled"):
+            self._okx_timer.stop()
         self._tray.setToolTip("CryptoHub arka planda · sinyal ve alarmlar açık")
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.hide()
@@ -7528,7 +7693,10 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
         self._sync_feed()
+        if not self._okx_timer.isActive():
+            self._okx_timer.start()
         if was_hidden:
+            self._tray_hour_id = None
             self._start_list()
             self._start_snapshot(force=True, with_chart=True)
 
@@ -7544,10 +7712,25 @@ class MainWindow(QMainWindow):
 
     def _on_tick(self) -> None:
         if self._background:
-            self._start_snapshot(force=False, with_chart=False)
+            self._tray_signal()
             return
         self._start_list()
         self._start_snapshot(force=False)
+
+    def _tray_signal(self) -> None:
+        """Saat değişmediyse istek yok. Değişince saatlik ve üstü sinyal görüntüsü alınır."""
+        if is_index(self._symbol):
+            return
+        hour = int(time.time() * 1000) // HOUR_MS
+        if self._tray_hour_id == hour:
+            return
+        if self._thread_running("_snap"):
+            return
+        if not (set(self._windows_on) & set(SIGNAL_WINDOWS)):
+            self._tray_hour_id = hour
+            return
+        self._tray_hour_id = hour
+        self._start_snapshot(force=False, with_chart=False, tray=True)
 
     def _thread_running(self, attr: str) -> bool:
         worker = getattr(self, attr)
@@ -7636,7 +7819,7 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(message)
 
-    def _start_snapshot(self, force: bool, with_chart: bool = True) -> None:
+    def _start_snapshot(self, force: bool, with_chart: bool = True, tray: bool = False) -> None:
         if is_index(self._symbol):
             if not self._background:
                 self._start_index(force)
@@ -7650,12 +7833,17 @@ class MainWindow(QMainWindow):
         stored = _read_state().get("signal_open")
         entry = stored.get(self._symbol) if isinstance(stored, dict) else None
         episodes = entry if isinstance(entry, dict) else {}
+        enabled = set(self._windows_on)
+        if tray:
+            enabled &= set(SIGNAL_WINDOWS)
+        self._tray_snap_gen = generation if tray else None
         worker = SnapshotWorker(
             self._symbol,
             self._interval,
             with_chart=with_chart and not self._background,
-            enabled=set(self._windows_on),
+            enabled=enabled,
             episodes=episodes,
+            tray=tray,
         )
         worker.done.connect(lambda payload, gen=generation: self._on_snapshot(gen, payload))
         worker.failed.connect(lambda message, gen=generation: self._on_snap_fail(gen, message))
@@ -7843,11 +8031,13 @@ class MainWindow(QMainWindow):
     def _on_snapshot(self, generation: int, snapshot: Snapshot) -> None:
         if generation != self._snap_gen or snapshot.symbol != self._symbol:
             return
-        if self._background:
-            self._maybe_telegram(snapshot)
+        if self._background or generation == self._tray_snap_gen:
+            if self._background:
+                self._maybe_telegram(snapshot)
             return
         self.heading.setText(snapshot.base)
         self.header_price.setText(format_price(snapshot.price))
+        self._sync_volume_price(snapshot.price, (snapshot.session_change or 0) >= 0)
         self._session_change = snapshot.session_change
         self._paint_change()
         self._paint(self._cards["price"][0], format_price(snapshot.price), "flat")
@@ -8093,6 +8283,7 @@ class MainWindow(QMainWindow):
         self._live_up = last.close >= last.open
         self._live_set = self._drawn_sets.get(int(last.time_ms))
         self.price_view.set_last_price(last.time_ms, last.close, last.close >= last.open)
+        self._sync_volume_price(last.close, last.close >= last.open)
         self.price_view.set_bands(self._band_points)
         self._sync_signals()
         self._note_price_home()
@@ -8195,14 +8386,35 @@ class MainWindow(QMainWindow):
         elif not self.funding_view.price_manual:
             self._fit_visible_funding()
 
+    def _aim_price(self, episodes: dict, label: str, verdict: str, spot: float | None) -> float | None:
+        """Short hedefi girişin de canlı fiyatın da altında kalır."""
+        episode = episodes.get(label) if isinstance(episodes, dict) else None
+        entry = episode.get("entry") if isinstance(episode, dict) else None
+        side = _trade_side(verdict)
+        if not isinstance(spot, (int, float)) or float(spot) <= 0:
+            return spot
+        if not isinstance(entry, (int, float)) or float(entry) <= 0:
+            return float(spot)
+        if side == "down":
+            return min(float(spot), float(entry))
+        if side == "up":
+            return max(float(spot), float(entry))
+        return float(spot)
+
     def _liquidity_target(self, verdict: str, hours: int, price: float | None) -> float | None:
         side = _trade_side(verdict)
         if side is None:
             return None
-        table = self._liq_targets.get((hours, self._liq_conserved))
-        if table is None or table.symbol != self._symbol:
-            return None
-        return table.pick(side, price)
+        ladder = (24, 72, 168, 720)
+        spans = ladder[ladder.index(hours):] if hours in ladder else (hours,)
+        for span in spans:
+            table = self._liq_targets.get((span, self._liq_conserved))
+            if table is None or table.symbol != self._symbol:
+                continue
+            level = table.pick(side, price)
+            if level is not None:
+                return level
+        return None
 
     def _flush_held_signal(self) -> None:
         """Coin değişince bekleyen sinyali duran haritayla kapatır."""
@@ -8239,8 +8451,9 @@ class MainWindow(QMainWindow):
         stored = data.get("signal_open")
         book = dict(stored) if isinstance(stored, dict) else {}
         if not fresh:
+            open_book = book.get(snapshot.symbol) if isinstance(book.get(snapshot.symbol), dict) else {}
             trial_targets = {
-                label: self._liquidity_target(verdict, SIGNAL_LIQ_HOURS[label], snapshot.price)
+                label: self._liquidity_target(verdict, SIGNAL_LIQ_HOURS[label], self._aim_price(open_book, label, verdict, snapshot.price))
                 for label, verdict in verdicts.items()
                 if label in SIGNAL_LIQ_HOURS
             }
@@ -8267,12 +8480,12 @@ class MainWindow(QMainWindow):
             for label, verdict in list(verdicts.items()):
                 if _trade_side(verdict):
                     verdicts.pop(label, None)
+        previous = book.get(snapshot.symbol) if isinstance(book.get(snapshot.symbol), dict) else {}
         targets = {
-            label: self._liquidity_target(verdict, SIGNAL_LIQ_HOURS[label], snapshot.price)
+            label: self._liquidity_target(verdict, SIGNAL_LIQ_HOURS[label], self._aim_price(previous, label, verdict, snapshot.price))
             for label, verdict in verdicts.items()
             if label in SIGNAL_LIQ_HOURS
         }
-        previous = book.get(snapshot.symbol) if isinstance(book.get(snapshot.symbol), dict) else {}
         touches = snapshot.touches if isinstance(snapshot.touches, dict) else {}
         book, events, notes = _advance_signal(
             book, snapshot.symbol, candles, verdicts, targets, snapshot.price, touches
@@ -8577,6 +8790,8 @@ class MainWindow(QMainWindow):
         return creds, bool(data.get("okx_simulated"))
 
     def _poll_okx(self, force: bool = False) -> None:
+        if self._background and not _read_state().get("okx_enabled"):
+            return
         creds, simulated = self._okx_account()
         if not creds.ready():
             if self._okx_live or self._okx_live_error:
@@ -9055,6 +9270,9 @@ class MainWindow(QMainWindow):
         self._paint_row_price(price)
         self._paint_15_price(price)
         self._touch_candle(price)
+        candles = self._last_candles
+        rising = price >= candles[-1].open if candles else self._live_up
+        self._sync_volume_price(price, rising)
         self._sync_limit_price()
         self._paint_okx_liq()
 
@@ -9129,6 +9347,7 @@ class MainWindow(QMainWindow):
         candle_set.setLow(low)
         candle_set.setClose(price)
         self.price_view.set_last_price(bar.time_ms, price, price >= bar.open)
+        self._sync_volume_price(price, price >= bar.open)
         if self.price_view.zoomed or self.price_view.price_manual:
             return
         if price < float(self.price_y.min()) or price > float(self.price_y.max()):
@@ -9411,6 +9630,10 @@ class MainWindow(QMainWindow):
 
     def _on_snap_fail(self, generation: int, message: str) -> None:
         if generation != self._snap_gen:
+            return
+        if self._background:
+            if generation == self._tray_snap_gen:
+                self._tray_hour_id = None
             return
         self.statusBar().showMessage(f"{self._symbol} alınamadı: {message}")
 
