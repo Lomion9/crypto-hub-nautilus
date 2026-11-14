@@ -103,6 +103,15 @@ def format_index_price(symbol: str, value: float | None) -> str:
     return format_price(value)
 
 
+def release_memory() -> None:
+    global _quote_at, _quote_cache
+    with _lock:
+        _quote_at = 0.0
+        _quote_cache = []
+        _crypto_cache.clear()
+        _yahoo_cache.clear()
+
+
 def index_quotes_fresh() -> bool:
     return bool(_quote_cache) and time.time() - _quote_at < QUOTE_TTL
 

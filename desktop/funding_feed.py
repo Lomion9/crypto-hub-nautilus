@@ -32,6 +32,14 @@ _BINANCE_HOURS: dict[str, float] = {}
 _BINANCE_AT = 0.0
 
 
+def release_memory() -> None:
+    with _LOCK:
+        _KEPT.clear()
+        _PACKS.clear()
+        _PACK_AT.clear()
+        _HIST.clear()
+
+
 @dataclass
 class Quote:
     raw: float

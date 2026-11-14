@@ -157,7 +157,7 @@ def _ensure_loaded() -> None:
             _MISSING.discard(key)
 
 
-def _save() -> None:
+def _save() -> bool:
     payload = {
         "missing": sorted(_MISSING),
         "books": {key: _book_out(book) for key, book in _BOOKS.items()},
@@ -166,7 +166,18 @@ def _save() -> None:
         with open(_path(), "w", encoding="utf-8") as handle:
             json.dump(payload, handle, separators=(",", ":"))
     except OSError:
-        pass
+        return False
+    return True
+
+
+def release_memory() -> None:
+    """CVD dosyaya yazılır, sonra bellek boşalır. Sonraki okuma dosyadan gelir."""
+    global _LOADED
+    with _LOCK:
+        if _BOOKS and not _save():
+            return
+        _BOOKS.clear()
+        _LOADED = False
 
 
 def _series_in(raw) -> list[dict]:

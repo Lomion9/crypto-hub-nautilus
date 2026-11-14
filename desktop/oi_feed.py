@@ -447,18 +447,33 @@ def _load_samples() -> None:
                     _SAMPLES[str(key)] = rows
 
 
-def _save_samples() -> None:
+def _save_samples() -> bool:
     global _SAMPLES_DIRTY
     with _LOCK:
         if not _SAMPLES_DIRTY:
-            return
+            return True
         payload = {key: rows for key, rows in _SAMPLES.items()}
         _SAMPLES_DIRTY = False
     try:
         with open(_sample_path(), "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
     except OSError:
-        pass
+        return False
+    return True
+
+
+def release_memory() -> None:
+    """Saatlik örnekler diske yazılır. Seriler sonraki açılışta yeniden istenir."""
+    global _SAMPLES_LOADED
+    saved = _save_samples()
+    with _LOCK:
+        _KEPT.clear()
+        _MERGED.clear()
+        _PACKS.clear()
+        _LIVE_AT.clear()
+        if saved:
+            _SAMPLES.clear()
+            _SAMPLES_LOADED = False
 
 
 def _get(url: str, params: dict | None = None):

@@ -566,6 +566,12 @@ _KLINE_CACHE: dict[tuple, list[Bar]] = {}
 _KLINE_LOCK = threading.Lock()
 
 
+def release_kline_cache() -> None:
+    with _KLINE_LOCK:
+        _KLINE_CACHE.clear()
+    _FRESH.clear()
+
+
 def merge_kline_tail(cached: list[Bar], fresh: list[Bar], step: int, limit: int) -> list[Bar] | None:
     """Eski mumlar durur. Yeni mumlar uca eklenir. Aralık kopuksa None."""
     if not cached or not fresh or step <= 0:

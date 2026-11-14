@@ -27,7 +27,7 @@ from desktop.market import HOUR_MS, MarketError, fetch_klines, fetch_oi_page
 
 STREAM = "wss://fstream.binance.com/market/ws/btcusdt@forceOrder"
 LIQ_SYMBOL = "BTCUSDT"
-TAPE_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+TAPE_SYMBOLS = ("BTCUSDT",)
 DECISION_SYMBOL = "BTCUSDT"
 PONG_MS = 60_000
 HEART_MS = 5_000

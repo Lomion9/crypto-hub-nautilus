@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import bisect
+import gc
 import heapq
 import json
 import math
+import os
 import sys
 import html
+import threading
 import time
 import winreg
 import winsound
@@ -76,6 +79,8 @@ from PySide6.QtWidgets import (
 )
 
 from desktop.indicators import MA_TYPES, SOURCES, bollinger, bollinger_last
+from desktop.cvd_feed import release_memory as release_cvd
+from desktop.funding_feed import release_memory as release_funding
 from desktop.indices import (
     INDEXES,
     IndexDataError,
@@ -85,6 +90,7 @@ from desktop.indices import (
     is_index,
     load_index_chart,
     load_index_quotes,
+    release_memory as release_indices,
 )
 from desktop.liq_tape import LiquidationTape
 from desktop.liquidity import LiquidityMap, clip_map, load_liquidity
@@ -109,7 +115,9 @@ from desktop.format import (
     format_quantity,
     format_usd,
 )
+from desktop.secrets import load_secrets, save_secrets
 from desktop.volume_profile import VOLUME_RANGES, VolumeProfile, load_profile, signal_stop_level
+from desktop.oi_feed import release_memory as release_oi
 from desktop.market import (
     CHART_BARS,
     CHART_INTERVALS,
@@ -121,6 +129,7 @@ from desktop.market import (
     HOUR_MS,
     base_of,
     fetch_klines,
+    release_kline_cache,
     bars_since,
     fetch_klines_since,
     since_step,
@@ -368,6 +377,8 @@ def _load_startup() -> bool:
 
 _STATE_PATH: Path | None = None
 _STATE_TEXT: tuple[tuple[int, int], str] | None = None
+_STATE_LOCK = threading.RLock()
+_SECRET_KEYS = ("okx_api_key", "okx_secret", "okx_passphrase", "telegram_token", "telegram_chat_id")
 
 
 def _state_path() -> Path:
@@ -379,11 +390,18 @@ def _state_path() -> Path:
     return _STATE_PATH
 
 
+def _secrets_path() -> Path:
+    return _state_path().with_name("desktop_secrets.bin")
+
+
 def _state_text() -> str:
     """Dosya değişmediyse son okunan metin; her çağıran kendi kopyasını çözer."""
     global _STATE_TEXT
     path = _state_path()
-    info = path.stat()
+    try:
+        info = path.stat()
+    except OSError:
+        return ""
     key = (info.st_mtime_ns, info.st_size)
     if _STATE_TEXT is not None and _STATE_TEXT[0] == key:
         return _STATE_TEXT[1]
@@ -392,7 +410,20 @@ def _state_text() -> str:
     return text
 
 
-def _read_state() -> dict:
+def _write_state_file(data: dict) -> None:
+    global _STATE_TEXT
+    for key in _SECRET_KEYS:
+        data.pop(key, None)
+    text = json.dumps(data)
+    path = _state_path()
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
+    info = path.stat()
+    _STATE_TEXT = ((info.st_mtime_ns, info.st_size), text)
+
+
+def _disk_state() -> dict:
     try:
         data = json.loads(_state_text())
     except (OSError, ValueError):
@@ -400,19 +431,42 @@ def _read_state() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _lift_secrets(data: dict) -> dict:
+    """Durum dosyasında kalan anahtarları şifreli dosyaya taşır."""
+    moved = {key: data.pop(key) for key in _SECRET_KEYS if key in data}
+    secrets = load_secrets(_secrets_path())
+    if not moved:
+        return secrets
+    for key, value in moved.items():
+        if key not in secrets or secrets.get(key) in (None, ""):
+            secrets[key] = value
+    save_secrets(_secrets_path(), secrets)
+    _write_state_file(data)
+    return secrets
+
+
+def _read_state() -> dict:
+    with _STATE_LOCK:
+        data = _disk_state()
+        secrets = _lift_secrets(data)
+        data.update(secrets)
+        return data
+
+
 def _patch_state(**updates) -> None:
     global _STATE_TEXT
-    data = _read_state()
-    data.update(updates)
-    text = json.dumps(data)
-    path = _state_path()
-    try:
-        path.write_text(text, encoding="utf-8")
-        info = path.stat()
-    except OSError:
-        _STATE_TEXT = None
-        return
-    _STATE_TEXT = ((info.st_mtime_ns, info.st_size), text)
+    with _STATE_LOCK:
+        secret_updates = {key: updates.pop(key) for key in list(updates) if key in _SECRET_KEYS}
+        data = _disk_state()
+        secrets = _lift_secrets(data)
+        if secret_updates:
+            secrets.update(secret_updates)
+            save_secrets(_secrets_path(), secrets)
+        data.update(updates)
+        try:
+            _write_state_file(data)
+        except OSError:
+            _STATE_TEXT = None
 
 
 def _load_state() -> tuple[str, str]:
@@ -4076,8 +4130,10 @@ def _trade_side(verdict: str) -> str | None:
 
 def _episode_open(verdict: str, target, candle: int, spot) -> dict:
     side = _trade_side(verdict)
-    tp = _take_profit(side, target)
     entry_px = float(spot) if isinstance(spot, (int, float)) and float(spot) > 0 else None
+    if not _tp_stays_beyond(side, target, entry_px):
+        target = None
+    tp = _take_profit(side, target)
     return {
         "verdict": verdict,
         "quiet": False,
@@ -4327,7 +4383,8 @@ def _advance_signal(
             kept["side"] = kept.get("side") or _trade_side(verdict)
             anchor = kept.get("entry") if isinstance(kept.get("entry"), (int, float)) and float(kept.get("entry") or 0) > 0 else spot
             if not isinstance(stored, (int, float)) or stored <= 0 or not _tp_stays_beyond(kept.get("side"), stored, anchor):
-                stored = targets.get(label)
+                fresh = targets.get(label)
+                stored = fresh if _tp_stays_beyond(kept.get("side"), fresh, anchor) else None
                 kept["target"] = stored
                 kept["tp"] = _take_profit(kept.get("side"), stored)
                 if not isinstance(kept.get("entry"), (int, float)):
@@ -6703,7 +6760,7 @@ class MainWindow(QMainWindow):
         self._launch(worker, "_volume_worker")
 
     def _on_volume(self, generation: int, symbol: str, span: str, profile: object) -> None:
-        if generation != self._volume_gen or symbol != self._symbol or span != self._volume_range or self._page != "volume":
+        if self._background or generation != self._volume_gen or symbol != self._symbol or span != self._volume_range or self._page != "volume":
             return
         if not isinstance(profile, VolumeProfile):
             self._show_volume_note("veri yok")
@@ -7354,7 +7411,7 @@ class MainWindow(QMainWindow):
 
     def _on_liquidity(self, generation: int, payload: dict) -> None:
         book = payload.get("book") if isinstance(payload, dict) else None
-        if generation != self._liq_gen or book is None or book.symbol != self._symbol:
+        if self._background or generation != self._liq_gen or book is None or book.symbol != self._symbol:
             return
         self._stamp_liq_candle()
         self._liq_full = book
@@ -7379,7 +7436,7 @@ class MainWindow(QMainWindow):
         self._launch(worker, "_clip_worker")
 
     def _on_clips(self, generation: int, payload: dict) -> None:
-        if generation != self._clip_gen or payload.get("book") is not self._liq_full:
+        if self._background or generation != self._clip_gen or payload.get("book") is not self._liq_full:
             return
         self._liq_clips.update(payload.get("clips") or {})
         self._liq_targets.update(payload.get("targets") or {})
@@ -7482,22 +7539,27 @@ class MainWindow(QMainWindow):
             verdict = str(episode.get("verdict") or "")
             if verdict in QUIET_VERDICTS:
                 continue
-            target = self._liquidity_target(verdict, SIGNAL_LIQ_HOURS.get(label, 72), self._live_price)
+            side = _trade_side(verdict)
+            ceiling = self._aim_price({label: episode}, label, verdict, self._live_price)
+            target = self._liquidity_target(verdict, SIGNAL_LIQ_HOURS.get(label, 72), ceiling)
+            if not _tp_stays_beyond(side, target, ceiling):
+                target = None
             stored_target = episode.get("target")
             same = stored_target == target or (
                 isinstance(stored_target, (int, float))
                 and isinstance(target, (int, float))
                 and abs(float(stored_target) - float(target)) <= max(abs(float(target)) * 1e-6, 1e-6)
             )
-            if same:
+            stored_ok = _tp_stays_beyond(side, stored_target, ceiling)
+            if same and stored_ok:
                 continue
             kept = dict(episode)
             kept["target"] = target
-            kept["side"] = _trade_side(verdict)
+            kept["side"] = side
             positions = data.get("okx_positions")
             coin = positions.get(self._symbol) if isinstance(positions, dict) else None
             held = coin.get(label) if isinstance(coin, dict) else None
-            if not isinstance(held, dict):
+            if not isinstance(held, dict) or not stored_ok:
                 kept["tp"] = _take_profit(kept["side"], target)
             updated[label] = kept
             changed = True
@@ -7681,6 +7743,52 @@ class MainWindow(QMainWindow):
             self.hide()
         elif not self.isMinimized():
             self.showMinimized()
+        self._release_tray_memory()
+
+    def _release_tray_memory(self) -> None:
+        """Görünen seriler ve birikmiş önbellekler bırakılır. Saatlik sinyal durmaz."""
+        self._volume_gen += 1
+        self._liq_gen += 1
+        self._clip_gen += 1
+        self._history_gen += 1
+        self._index_gen += 1
+        self._last_candles = []
+        self._band_points = []
+        self._quotes = []
+        self._by_symbol = {}
+        self._index_quote_map = {}
+        self._funding_shown = []
+        self._funding_drawn = None
+        self._volume_shown = ("", "")
+        self._liq_full = None
+        self._liq_map = None
+        self._liq_clips = {}
+        self._liq_targets = {}
+        if hasattr(self, "price_chart"):
+            self._draw_candles([])
+        if hasattr(self, "table"):
+            self.table.setRowCount(0)
+        if hasattr(self, "analysis"):
+            self.analysis.setRowCount(0)
+        if hasattr(self, "oi_chart"):
+            self.oi_chart.removeAllSeries()
+        if hasattr(self, "funding_chart"):
+            self.funding_chart.removeAllSeries()
+        board = getattr(self, "_volume_board", None)
+        if board is not None:
+            board.set_profiles([])
+            board.set_last(None, True)
+        heat = getattr(self, "_heat", None)
+        if heat is not None:
+            heat.set_candles([])
+            heat.set_state(None, "")
+            heat._legend = None
+        release_kline_cache()
+        release_oi()
+        release_funding()
+        release_indices()
+        release_cvd()
+        gc.collect()
 
     def _leave_background(self) -> None:
         was_hidden = self._background
@@ -7799,7 +7907,7 @@ class MainWindow(QMainWindow):
         self._launch(worker, "_index_worker")
 
     def _on_index_chart(self, generation: int, chart) -> None:
-        if generation != self._index_gen or not is_index(self._symbol) or chart.symbol != self._symbol:
+        if self._background or generation != self._index_gen or not is_index(self._symbol) or chart.symbol != self._symbol:
             return
         self.heading.setText(chart.label)
         self.header_price.setText(format_index_price(chart.symbol, chart.price))
@@ -8391,10 +8499,10 @@ class MainWindow(QMainWindow):
         episode = episodes.get(label) if isinstance(episodes, dict) else None
         entry = episode.get("entry") if isinstance(episode, dict) else None
         side = _trade_side(verdict)
-        if not isinstance(spot, (int, float)) or float(spot) <= 0:
-            return spot
         if not isinstance(entry, (int, float)) or float(entry) <= 0:
-            return float(spot)
+            return float(spot) if isinstance(spot, (int, float)) and float(spot) > 0 else spot
+        if not isinstance(spot, (int, float)) or float(spot) <= 0:
+            return float(entry)
         if side == "down":
             return min(float(spot), float(entry))
         if side == "up":
