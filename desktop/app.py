@@ -743,7 +743,7 @@ def _load_drawings() -> dict[str, list[dict]]:
 
 def _load_bollinger() -> dict:
     raw = _read_state().get("bollinger")
-    settings = {"on": False, "length": 20, "ma": "SMA", "source": "close", "mult": 2.0, "offset": 0}
+    settings = {"on": False, "length": 20, "ma": "SMA", "source": "close", "mult": 2.0, "offset": 0, "shown": True}
     if not isinstance(raw, dict):
         return settings
     settings["on"] = bool(raw.get("on"))
@@ -757,6 +757,7 @@ def _load_bollinger() -> dict:
         settings["ma"] = str(raw.get("ma"))
     if str(raw.get("source")) in SOURCES:
         settings["source"] = str(raw.get("source"))
+    settings["shown"] = True if "shown" not in raw else bool(raw.get("shown"))
     return settings
 
 
@@ -767,11 +768,23 @@ def _signal_window(interval: str) -> str | None:
 
 def _load_signal() -> dict:
     raw = _read_state().get("signal_draw")
-    settings = {"on": False, "show_closed": True}
+    settings = {"on": False, "show_closed": True, "shown": True}
     if isinstance(raw, dict):
         settings["on"] = bool(raw.get("on"))
         if "show_closed" in raw:
             settings["show_closed"] = bool(raw.get("show_closed"))
+        if "shown" in raw:
+            settings["shown"] = bool(raw.get("shown"))
+    return settings
+
+
+def _load_trend() -> dict:
+    raw = _read_state().get("trend")
+    settings = {"on": False, "shown": True}
+    if isinstance(raw, dict):
+        settings["on"] = bool(raw.get("on"))
+        if "shown" in raw:
+            settings["shown"] = bool(raw.get("shown"))
     return settings
 
 
@@ -959,7 +972,7 @@ def _signal_dialog(parent, settings: dict) -> dict | None:
     layout.addLayout(buttons)
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return None
-    return {"on": True, "show_closed": closed.isChecked()}
+    return {"on": True, "show_closed": closed.isChecked(), "shown": bool(settings.get("shown", True))}
 
 
 def _segment_distance(pos: QPointF, start: QPointF, end: QPointF) -> float:
@@ -1054,6 +1067,32 @@ def _icon_close() -> QIcon:
     return _tool_icon(draw)
 
 
+def _icon_eye(shown: bool) -> QIcon:
+    def draw(painter: QPainter) -> None:
+        painter.drawArc(3, 7, 14, 8, 0, 180 * 16)
+        painter.drawArc(3, 5, 14, 8, 180 * 16, 180 * 16)
+        painter.drawEllipse(8, 8, 4, 4)
+        if not shown:
+            painter.drawLine(4, 15, 16, 4)
+
+    return _tool_icon(draw)
+
+
+def _trend_dialog(parent) -> bool:
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Trend")
+    dialog.setMinimumWidth(320)
+    note = QLabel("Açık olan mum aralığından hesaplanır.")
+    note.setWordWrap(True)
+    layout = QVBoxLayout(dialog)
+    layout.addWidget(note)
+    close = QPushButton("Kapat")
+    close.clicked.connect(dialog.accept)
+    layout.addWidget(close)
+    dialog.exec()
+    return False
+
+
 def _icon_settings() -> QIcon:
     def draw(painter: QPainter) -> None:
         painter.drawEllipse(6, 6, 8, 8)
@@ -1143,6 +1182,7 @@ def _bollinger_dialog(parent, settings: dict) -> dict | None:
         "source": names.get(source.currentText(), "close"),
         "mult": mult.value(),
         "offset": offset.value(),
+        "shown": bool(settings.get("shown", True)),
     }
 
 
@@ -1256,6 +1296,17 @@ def _margin_pct(data: dict) -> int:
     except (TypeError, ValueError):
         return 10
     return min(100, max(1, pct))
+
+
+def _risk_pct(data: dict) -> float:
+    """Otomatik işlemde göze alınan kasa yüzdesi. Kayıt yoksa %8."""
+    try:
+        pct = float(data.get("okx_risk_pct"))
+    except (TypeError, ValueError):
+        return 8.0
+    if not math.isfinite(pct):
+        return 8.0
+    return min(25.0, max(0.5, pct))
 
 
 POSITION_COLUMNS = (
@@ -4074,6 +4125,19 @@ class _SignalEvent:
         self.stop = stop
 
 
+def _sl_beyond(side: str | None, level, price) -> bool:
+    """Long stop girişin altında, short stop girişin üstünde kalır."""
+    if side not in ("up", "down"):
+        return False
+    if not isinstance(level, (int, float)) or not isinstance(price, (int, float)):
+        return False
+    if float(level) <= 0 or float(price) <= 0 or float(level) == float(price):
+        return False
+    if side == "up":
+        return float(level) < float(price)
+    return float(level) > float(price)
+
+
 def _tp_stays_beyond(side: str | None, level, price) -> bool:
     """Short take profit fiyatın altında, long take profit fiyatın üstünde kalır."""
     tp = _take_profit(side, level)
@@ -5428,6 +5492,24 @@ class _TargetTable:
                 best = level
         return best
 
+    def nearest_stop(self, side: str, price: float | None) -> float | None:
+        """İşlemin kendi tarafındaki en yakın küme. Long altta, short üstte."""
+        shown = self.shown
+        if self.window is None or side not in ("up", "down"):
+            return None
+        spot = price if isinstance(price, (int, float)) and price > 0 else (shown.closes[-1] if shown.closes else 0)
+        if spot <= 0:
+            return None
+        best: float | None = None
+        for level, _usd in self._entries():
+            if side == "up" and level < spot and (best is None or level > best):
+                best = level
+            elif side == "down" and level > spot and (best is None or level < best):
+                best = level
+        if best is None or best == spot:
+            return None
+        return best
+
 
 def _clip_set(book: LiquidityMap, spans: set[int], target_hours: set[int], conserved: bool) -> tuple[dict, dict]:
     clips: dict[tuple[int, bool], LiquidityMap] = {}
@@ -5610,6 +5692,7 @@ class MainWindow(QMainWindow):
         self._windows_on = _load_windows()
         self._bb = _load_bollinger()
         self._signal = _load_signal()
+        self._trend = _load_trend()
         self._signal_marks = _load_signal_marks()
         self._band_points: list[tuple[float, float | None, float | None, float | None]] = []
         self._drawings = _load_drawings()
@@ -5879,6 +5962,13 @@ class MainWindow(QMainWindow):
         indicator_layout.addWidget(add_signal)
         indicator_layout.addWidget(self._panel_toggles["oi"])
         indicator_layout.addWidget(self._panel_toggles["funding"])
+        add_trend = QPushButton("Trend")
+        add_trend.setIcon(_icon_indicator())
+        add_trend.setIconSize(QSize(16, 16))
+        add_trend.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_trend.setStyleSheet(add_bb.styleSheet())
+        add_trend.clicked.connect(self._add_trend)
+        indicator_layout.addWidget(add_trend)
         indicator_layout.addStretch(1)
         column.addWidget(brand)
         body = QHBoxLayout()
@@ -5994,11 +6084,45 @@ class MainWindow(QMainWindow):
                 tool = "fib"
         self.price_view.set_draw_tool(tool)
 
+    def _add_trend(self) -> None:
+        if self._trend.get("on"):
+            self.statusBar().showMessage("Trend zaten grafikte")
+            return
+        self._trend["on"] = True
+        self._trend["shown"] = True
+        self._store_trend()
+
+    def _close_trend(self) -> None:
+        self._trend["on"] = False
+        self._store_trend()
+
+    def _edit_trend(self) -> None:
+        _trend_dialog(self)
+
+    def _store_trend(self) -> None:
+        _patch_state(trend=self._trend)
+        self._sync_indicator_caption()
+        self._ensure_regime()
+        self._place_caption()
+
+    def _hide_bollinger(self) -> None:
+        self._bb["shown"] = not bool(self._bb.get("shown", True))
+        self._store_bb()
+
+    def _hide_signal(self) -> None:
+        self._signal["shown"] = not bool(self._signal.get("shown", True))
+        self._store_signal()
+
+    def _hide_trend(self) -> None:
+        self._trend["shown"] = not bool(self._trend.get("shown", True))
+        self._store_trend()
+
     def _add_bollinger(self) -> None:
         if self._bb.get("on"):
             self.statusBar().showMessage("Bollinger Bandı zaten grafikte")
             return
         self._bb["on"] = True
+        self._bb["shown"] = True
         self._store_bb()
 
     def _close_bollinger(self) -> None:
@@ -6017,6 +6141,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Signal zaten grafikte")
             return
         self._signal["on"] = True
+        self._signal["shown"] = True
         self._store_signal()
 
     def _close_signal(self) -> None:
@@ -6074,7 +6199,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "price_view"):
             return
         self._paint_position_lines()
-        if not self._signal.get("on") or self._index_mode:
+        if not self._signal.get("on") or not self._signal.get("shown", True) or self._index_mode:
             self.price_view.set_signals([], "")
             return
         label = _signal_window(self._interval)
@@ -6109,12 +6234,20 @@ class MainWindow(QMainWindow):
             if widget is not None:
                 widget.deleteLater()
         if self._bb.get("on"):
-            self._indicator_chip("Bollinger Bandı", self._close_bollinger, self._edit_bollinger)
+            self._indicator_chip(
+                "Bollinger Bandı", self._close_bollinger, self._edit_bollinger, self._hide_bollinger, bool(self._bb.get("shown", True))
+            )
         if self._signal.get("on"):
-            self._indicator_chip("Signal", self._close_signal, self._edit_signal)
+            self._indicator_chip(
+                "Signal", self._close_signal, self._edit_signal, self._hide_signal, bool(self._signal.get("shown", True))
+            )
+        if self._trend.get("on"):
+            self._indicator_chip(
+                "Trend", self._close_trend, self._edit_trend, self._hide_trend, bool(self._trend.get("shown", True))
+            )
         self._place_caption()
 
-    def _indicator_chip(self, title: str, close_action, settings_action) -> None:
+    def _indicator_chip(self, title: str, close_action, settings_action, eye_action, shown: bool) -> None:
         row = QWidget()
         row.setObjectName("chip")
         row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -6130,9 +6263,11 @@ class MainWindow(QMainWindow):
         line.setSpacing(2)
         name = QLabel(title)
         close = QPushButton()
+        eye = QPushButton()
         settings = QPushButton()
         for button, icon, tip, action in (
             (close, _icon_close(), "Kaldır", close_action),
+            (eye, _icon_eye(shown), "Gizle" if shown else "Göster", eye_action),
             (settings, _icon_settings(), "Ayarlar", settings_action),
         ):
             button.setIcon(icon)
@@ -6143,21 +6278,36 @@ class MainWindow(QMainWindow):
             button.clicked.connect(action)
         line.addWidget(name)
         line.addWidget(close)
+        line.addWidget(eye)
         line.addWidget(settings)
         line.addStretch(1)
         self._indicator_rows.addWidget(row)
 
-    def _place_caption(self) -> None:
+    def _place_caption(self, *_args) -> None:
         if not hasattr(self, "_chart_caption"):
             return
         self._chart_caption.adjustSize()
         self._chart_caption.move(8, 4)
         self._chart_caption.raise_()
         table = getattr(self, "_trend_table", None)
-        if table is not None:
-            table.adjustSize()
-            table.move(8, self._chart_caption.height() + 8)
-            table.raise_()
+        if table is None:
+            return
+        visible = bool(self._trend.get("on")) and bool(self._trend.get("shown", True))
+        table.setVisible(visible)
+        if not visible:
+            return
+        table.adjustSize()
+        plot = self.price_view.chart().plotArea()
+        margin = 8
+        if plot.width() > table.width() + margin * 2:
+            x = int(plot.right() - table.width() - margin)
+            y = int(plot.top() + margin)
+        else:
+            view = self.price_view.viewport()
+            x = max(margin, view.width() - table.width() - margin)
+            y = margin
+        table.move(x, y)
+        table.raise_()
 
     def _build_trend_table(self) -> None:
         frame = QFrame(self.price_view.viewport())
@@ -6211,6 +6361,9 @@ class MainWindow(QMainWindow):
 
     def _ensure_regime(self) -> None:
         if not hasattr(self, "_trend_table"):
+            return
+        if not self._trend.get("on"):
+            self._place_caption()
             return
         if self._background or is_index(self._symbol) or self._interval not in CHART_INTERVALS:
             self._paint_trend(None)
@@ -6523,6 +6676,7 @@ class MainWindow(QMainWindow):
         caption_layout.addWidget(self._chart_title)
         caption_layout.addLayout(self._indicator_rows)
         self.price_view.installEventFilter(self)
+        self.price_chart.plotAreaChanged.connect(self._place_caption)
         self._build_trend_table()
 
         self.oi_chart = QChart()
@@ -6703,6 +6857,18 @@ class MainWindow(QMainWindow):
         self._okx_lever.valueChanged.connect(self._on_lever_changed)
         lever_box.addWidget(self._okx_lever)
         spins.addLayout(lever_box)
+        risk_box = QVBoxLayout()
+        risk_box.addWidget(QLabel("İşlem riski %"))
+        self._okx_risk = QDoubleSpinBox()
+        self._okx_risk.setRange(0.5, 25)
+        self._okx_risk.setDecimals(1)
+        self._okx_risk.setSingleStep(0.1)
+        self._okx_risk.setValue(_risk_pct(data))
+        self._okx_risk.setFixedWidth(72)
+        self._okx_risk.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._okx_risk.valueChanged.connect(lambda _value: self._save_okx_form())
+        risk_box.addWidget(self._okx_risk)
+        spins.addLayout(risk_box)
         spins.addStretch(1)
         column.addLayout(spins)
         column.addWidget(QLabel("Marjin (kullanılabilir bakiyenin yüzdesi)"))
@@ -6983,6 +7149,7 @@ class MainWindow(QMainWindow):
             okx_enabled=self._okx_enabled.isChecked(),
             okx_simulated=self._okx_simulated.isChecked(),
             okx_leverage=int(self._okx_lever.value()),
+            okx_risk_pct=float(self._okx_risk.value()),
             okx_margin_pct=int(self._okx_margin.value()),
             okx_mgn_mode=str(self._okx_mode.currentData() or "cross"),
             okx_windows=windows,
@@ -7507,7 +7674,9 @@ class MainWindow(QMainWindow):
                 if not isinstance(tp, (int, float)) or float(tp) <= 0:
                     tp = _take_profit(side if isinstance(side, str) else None, target)
                 tp_text = "TP yok" if tp is None else f"TP {_format_tp(tp)}"
-                detail = f"{format_price(float(target))} · {tp_text}"
+                sl = episode.get("sl")
+                sl_text = f" · SL {format_price(float(sl))}" if isinstance(sl, (int, float)) and float(sl) > 0 else ""
+                detail = f"{format_price(float(target))} · {tp_text}{sl_text}"
             else:
                 detail = "Hedef yok"
             signal_rows.append((label, "—" if quiet else verdict, tone, f"{clock}  {detail} · {_score_line(coin, label)}".strip()))
@@ -8143,11 +8312,14 @@ class MainWindow(QMainWindow):
 
     def _refresh_bands(self) -> None:
         self._compute_bands()
+        if not self._bb.get("shown", True):
+            self.price_view.set_bands([])
+            return
         self.price_view.set_bands(self._band_points)
 
     def _refresh_last_band(self) -> None:
         candles = self._last_candles
-        if is_index(self._symbol) or not self._bb.get("on") or len(candles) < 2 or not self._band_points:
+        if is_index(self._symbol) or not self._bb.get("on") or not self._bb.get("shown", True) or len(candles) < 2 or not self._band_points:
             self._refresh_bands()
             return
         self._band_points = bollinger_last(
@@ -8163,6 +8335,8 @@ class MainWindow(QMainWindow):
         self.price_view.set_bands(self._band_points)
 
     def _include_bands(self, lows: float, highs: float, start: float | None = None, end: float | None = None):
+        if not self._bb.get("shown", True):
+            return lows, highs
         for time_ms, _basis, upper, lower in self._band_points:
             if upper is None or lower is None:
                 continue
@@ -8411,6 +8585,22 @@ class MainWindow(QMainWindow):
                 return level
         return None
 
+    def _stop_level(self, verdict: str, hours: int, price: float | None) -> float | None:
+        """Kendi taraftaki en yakın küme. Take profit'in baktığı taraf değildir."""
+        side = _trade_side(verdict)
+        if side is None or not isinstance(price, (int, float)) or float(price) <= 0:
+            return None
+        ladder = (24, 72, 168, 720)
+        spans = ladder[ladder.index(hours):] if hours in ladder else (hours,)
+        for span in spans:
+            table = self._liq_targets.get((span, self._liq_conserved))
+            if table is None or table.symbol != self._symbol:
+                continue
+            level = table.nearest_stop(side, float(price))
+            if _sl_beyond(side, level, float(price)):
+                return float(level)
+        return None
+
     def _trap_bucket(self, verdict: str, hours: int, price: float) -> float | None:
         """Take profit'in haritasında, işlemin ters tarafındaki en büyük kova."""
         side = _trade_side(verdict)
@@ -8505,6 +8695,17 @@ class MainWindow(QMainWindow):
         if snapshot.symbol == DECISION_SYMBOL and any(event.kind == "yeni" for event in events):
             self._liq_tape.note_signal(int(time.time() * 1000), snapshot.price)
         current = book.get(snapshot.symbol) if isinstance(book.get(snapshot.symbol), dict) else {}
+        for event in events:
+            if event.kind != "yeni":
+                continue
+            episode = current.get(event.label) if isinstance(current.get(event.label), dict) else None
+            if not isinstance(episode, dict):
+                continue
+            hours = SIGNAL_LIQ_HOURS.get(event.label)
+            entry = episode.get("entry")
+            spot = float(entry) if isinstance(entry, (int, float)) and float(entry) > 0 else snapshot.price
+            level = self._stop_level(event.verdict, hours, spot) if isinstance(hours, int) else None
+            episode["sl"] = float(level) if _sl_beyond(episode.get("side"), level, spot) else None
 
         def _stamp(entry: dict, label: str):
             episode = entry.get(label)
@@ -8615,6 +8816,7 @@ class MainWindow(QMainWindow):
         return {
             "creds": creds,
             "margin_pct": pct,
+            "risk_pct": _risk_pct(data),
             "leverage": leverage,
             "mgn_mode": mode if mode in ("cross", "isolated") else "cross",
             "simulated": bool(data.get("okx_simulated")),
@@ -8694,11 +8896,17 @@ class MainWindow(QMainWindow):
             tp = episode.get("tp")
             entry = episode.get("entry")
             spot = float(entry) if isinstance(entry, (int, float)) and float(entry) > 0 else price
+            sl = episode.get("sl")
+            if not _sl_beyond(episode.get("side"), sl, spot):
+                _okx_note(snapshot.symbol, event.label, "open", False, "emir gitmedi: stop kümesi yok")
+                self._show_okx_log()
+                continue
             action = {
                 "op": "open",
                 "label": event.label,
                 "side": episode.get("side"),
                 "tp": tp,
+                "sl": float(sl),
                 "price": spot,
             }
             if family in ("Long Trap", "Short Trap") and spot > 0:
@@ -8721,6 +8929,7 @@ class MainWindow(QMainWindow):
             "price": price,
             "settings": {
                 "margin_pct": settings["margin_pct"],
+                "risk_pct": settings["risk_pct"],
                 "leverage": settings["leverage"],
                 "mgn_mode": settings["mgn_mode"],
                 "simulated": settings["simulated"],

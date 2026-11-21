@@ -285,6 +285,117 @@ def _hedge(creds: Creds, simulated: bool) -> bool:
     return row.get("posMode") == "long_short_mode"
 
 
+def plan_risk(
+    equity: float,
+    risk_pct: float,
+    entry: float,
+    stop: float,
+    cap: int,
+    tier_cap: int = 0,
+    mmr: float = 0.004,
+) -> tuple[int, float, float] | None:
+    """Kaldıraç, marjin ve pozisyon büyüklüğü. Kaldıraç aşağı tam sayıdır."""
+    if equity <= 0 or entry <= 0 or stop <= 0 or risk_pct <= 0:
+        return None
+    distance = abs(entry - stop) / entry
+    if distance <= 0 or distance >= 1:
+        return None
+    risk = equity * risk_pct / 100.0
+    notional = risk / distance
+    cushion = distance + (mmr if mmr > 0 else 0.004)
+    if cushion <= 0:
+        return None
+    lever = int(math.floor(1.0 / cushion))
+    ceiling = cap if cap > 0 else lever
+    if tier_cap > 0:
+        ceiling = min(ceiling, tier_cap)
+    if ceiling < 1:
+        return None
+    lever = max(1, min(lever, ceiling))
+    margin = notional / lever
+    if margin > equity:
+        margin = equity
+        notional = equity * lever
+    if margin <= 0 or notional <= 0:
+        return None
+    return lever, margin, notional
+
+
+def _tier_cap(inst: str, contracts: float, mode: str) -> tuple[int, float]:
+    """Bu sözleşme boyunun kademe tavanı ve bakım marjı. Okunamazsa tavan yok."""
+    family = inst[: -len("-SWAP")] if inst.endswith("-SWAP") else inst
+    td = mode if mode in ("cross", "isolated") else "cross"
+    try:
+        response = requests.get(
+            f"{OKX}/api/v5/public/position-tiers",
+            params={"instType": "SWAP", "tdMode": td, "instFamily": family},
+            timeout=12,
+        )
+        payload = response.json()
+    except (requests.RequestException, ValueError):
+        return 0, 0.004
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return 0, 0.004
+    covering: list[tuple[float, int, float]] = []
+    lowest: tuple[int, float] | None = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            lever = int(float(row["maxLever"]))
+            keep = float(row.get("mmr") or 0.004)
+            max_sz = float(row.get("maxSz") or 0)
+            min_sz = float(row.get("minSz") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if lever < 1:
+            continue
+        if lowest is None or lever < lowest[0]:
+            lowest = (lever, keep if keep > 0 else 0.004)
+        if max_sz > 0 and min_sz <= contracts <= max_sz:
+            covering.append((max_sz, lever, keep if keep > 0 else 0.004))
+    if covering:
+        covering.sort()
+        return covering[0][1], covering[0][2]
+    if lowest is not None and contracts > 0:
+        return lowest
+    return 0, 0.004
+
+
+def size_for_risk(
+    symbol: str,
+    equity: float,
+    risk_pct: float,
+    entry: float,
+    stop: float,
+    mode: str,
+) -> tuple[int, float]:
+    """Otomatik emrin kaldıracı ve marjini. Borsa tavanının üstüne çıkmaz."""
+    info = _public_instrument(inst_id(symbol))
+    try:
+        cap = int(float(info.get("lever") or 0))
+    except (TypeError, ValueError):
+        cap = 0
+    if cap < 1:
+        raise OkxError("Kaldıraç sınırı alınamadı")
+    preview = plan_risk(equity, risk_pct, entry, stop, cap)
+    if preview is None:
+        raise OkxError("Stop mesafesi yok, emir yok")
+    _lever, _margin, notional = preview
+    ct_val = float(info.get("ctVal") or 0)
+    unit = ct_val if str(info.get("ctValCcy") or "").upper() == "USDT" else ct_val * entry
+    contracts = notional / unit if unit > 0 else 0.0
+    tier_cap, mmr = _tier_cap(inst_id(symbol), contracts, mode)
+    chosen = plan_risk(equity, risk_pct, entry, stop, cap, tier_cap, mmr)
+    if chosen is None:
+        raise OkxError("Stop mesafesi yok, emir yok")
+    lever, margin, _notional = chosen
+    if margin <= 0 or lever < 1:
+        raise OkxError("Kullanılabilir bakiye yok")
+    return lever, margin
+
+
 def _set_leverage(creds: Creds, inst: str, lever: int, mode: str, pos_side: str, simulated: bool, cap: int) -> int:
     asked = int(lever)
     if asked < 1:
@@ -391,7 +502,7 @@ def open_market(
     }
 
 
-def _open(creds: Creds, symbol: str, side: str, tp: float, price: float, margin: float, leverage: int, mode: str, simulated: bool, limit: float | None = None) -> dict:
+def _open(creds: Creds, symbol: str, side: str, tp: float, price: float, margin: float, leverage: int, mode: str, simulated: bool, limit: float | None = None, sl: float | None = None) -> dict:
     entry = float(limit) if isinstance(limit, (int, float)) and float(limit) > 0 else price
     if side not in ("up", "down"):
         raise OkxError("Yön yok, emir yok")
@@ -409,6 +520,15 @@ def _open(creds: Creds, symbol: str, side: str, tp: float, price: float, margin:
         raise OkxError("Take profit girişin altında, emir yok")
     if side == "down" and tp_px >= entry:
         raise OkxError("Take profit girişin üstünde, emir yok")
+    sl_px = None
+    if isinstance(sl, (int, float)) and float(sl) > 0:
+        sl_px = _round_step(float(sl), tick)
+        if sl_px <= 0:
+            raise OkxError("Stop yok, emir yok")
+        if side == "up" and sl_px >= entry:
+            raise OkxError("Stop girişin üstünde, emir yok")
+        if side == "down" and sl_px <= entry:
+            raise OkxError("Stop girişin altında, emir yok")
     hedge = _hedge(creds, simulated)
     pos_side = ("long" if side == "up" else "short") if hedge else "net"
     try:
@@ -426,6 +546,10 @@ def _open(creds: Creds, symbol: str, side: str, tp: float, price: float, margin:
         "tpOrdPx": "-1",
         "tpTriggerPxType": "last",
     }
+    if sl_px is not None:
+        algo["slTriggerPx"] = _text_step(sl_px, tick if tick > 0 else 0.00000001)
+        algo["slOrdPx"] = "-1"
+        algo["slTriggerPxType"] = "last"
     body = {
         "instId": inst,
         "tdMode": mode,
@@ -451,6 +575,7 @@ def _open(creds: Creds, symbol: str, side: str, tp: float, price: float, margin:
     word = "long" if side == "up" else "short"
     rows = payload.get("data") or []
     ord_id = str(rows[0].get("ordId") or "") if rows and isinstance(rows[0], dict) else ""
+    stop_text = f" · {used}x · SL {format_price(sl_px)}" if sl_px is not None else ""
     return {
         "inst": inst,
         "side": side,
@@ -458,9 +583,10 @@ def _open(creds: Creds, symbol: str, side: str, tp: float, price: float, margin:
         "sz": sz,
         "td_mode": mode,
         "tp": tp_px,
+        "sl": sl_px,
         "ord_id": ord_id,
         "algo_id": algo_id,
-        "message": f"{word} açıldı · {sz} sözleşme{extra} · TP {format_price(tp_px)}",
+        "message": f"{word} açıldı · {sz} sözleşme{extra} · TP {format_price(tp_px)}{stop_text}",
     }
 
 
@@ -591,11 +717,6 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
     if mode not in ("cross", "isolated"):
         mode = "cross"
     simulated = bool(settings.get("simulated"))
-    try:
-        pct = float(settings.get("margin_pct") or 0)
-        leverage = int(settings.get("leverage") or 0)
-    except (TypeError, ValueError):
-        pct, leverage = 0.0, 0
     for action in actions:
         label = str(action.get("label") or "")
         op = str(action.get("op") or "")
@@ -638,6 +759,8 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
             }
             if isinstance(held.get("limits"), list):
                 position["limits"] = list(held["limits"])
+            if isinstance(held.get("sl"), (int, float)) and float(held.get("sl") or 0) > 0:
+                position["sl"] = float(held["sl"])
             results.append(_row(symbol, label, op, True, str(updated.get("message") or "TP güncellendi"), position))
             continue
         if op not in ("open", "scale"):
@@ -651,13 +774,27 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
             if not isinstance(raw_tp, (int, float)) or float(raw_tp) <= 0:
                 raise OkxError("Hedef yok, emir yok")
             spot = float(action.get("price") or price)
-            if pct <= 0:
-                raise OkxError("Marjin yüzdesi seçilmedi")
-            margin = available_usdt(creds, simulated) * min(pct, 100.0) / 100
-            if margin <= 0:
+            raw_sl = action.get("sl")
+            if not isinstance(raw_sl, (int, float)) or float(raw_sl) <= 0:
+                raise OkxError("Stop kümesi yok, emir yok")
+            try:
+                risk_pct = float(settings.get("risk_pct") or 0)
+            except (TypeError, ValueError):
+                risk_pct = 0.0
+            if risk_pct <= 0:
+                raise OkxError("İşlem riski seçilmedi")
+            equity = available_usdt(creds, simulated)
+            if equity <= 0:
                 raise OkxError("Kullanılabilir bakiye yok")
+            if side == "up" and float(raw_sl) >= spot:
+                raise OkxError("Stop girişin üstünde, emir yok")
+            if side == "down" and float(raw_sl) <= spot:
+                raise OkxError("Stop girişin altında, emir yok")
+            leverage, margin = size_for_risk(symbol, equity, risk_pct, spot, float(raw_sl), mode)
             parts = 3 if op == "scale" else 1
-            opened = _open(creds, symbol, side, float(raw_tp), spot, margin / parts, leverage, mode, simulated)
+            opened = _open(
+                creds, symbol, side, float(raw_tp), spot, margin / parts, leverage, mode, simulated, sl=float(raw_sl)
+            )
         except (OkxError, TypeError, ValueError) as exc:
             text = str(exc) if str(exc) else "emir gitmedi"
             results.append(_row(symbol, label, op, False, text, None))
@@ -672,7 +809,17 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
                     continue
                 try:
                     leg = _open(
-                        creds, symbol, side, float(raw_tp), level, margin / parts, leverage, mode, simulated, level
+                        creds,
+                        symbol,
+                        side,
+                        float(raw_tp),
+                        level,
+                        margin / parts,
+                        leverage,
+                        mode,
+                        simulated,
+                        level,
+                        float(raw_sl),
                     )
                 except (OkxError, TypeError, ValueError) as exc:
                     notes.append(str(exc) if str(exc) else "limit gitmedi")
@@ -681,6 +828,8 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
                     limits.append(str(leg["ord_id"]))
                 notes.append(str(leg["message"]))
         position = {key: opened[key] for key in ("inst", "side", "pos_side", "sz", "td_mode", "tp", "algo_id")}
+        if isinstance(opened.get("sl"), (int, float)) and float(opened.get("sl") or 0) > 0:
+            position["sl"] = float(opened["sl"])
         if limits:
             position["limits"] = limits
         results.append(_row(symbol, label, "open", True, " · ".join(notes), position))
