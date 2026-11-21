@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFrame,
     QFormLayout,
+    QGridLayout,
     QGraphicsItem,
     QHBoxLayout,
     QHeaderView,
@@ -92,7 +93,7 @@ from desktop.indices import (
     load_index_quotes,
     release_memory as release_indices,
 )
-from desktop.liq_tape import LiquidationTape
+from desktop.liq_tape import DECISION_SYMBOL, LiquidationTape
 from desktop.liquidity import LiquidityMap, clip_map, load_liquidity
 from desktop.okx_trade import (
     Creds,
@@ -100,8 +101,11 @@ from desktop.okx_trade import (
     available_usdt as okx_available,
     close_position as okx_close_position,
     execute as okx_execute,
+    cancel_order as okx_cancel_order,
+    fetch_open_orders,
     fetch_positions,
     max_leverage as okx_max_leverage,
+    order_face,
     open_market as okx_open_market,
     ping as okx_ping,
     set_tp_sl as okx_set_tp_sl,
@@ -116,7 +120,8 @@ from desktop.format import (
     format_usd,
 )
 from desktop.secrets import load_secrets, save_secrets
-from desktop.volume_profile import VOLUME_RANGES, VolumeProfile, load_profile, signal_stop_level
+from desktop.regime import NEED as REGIME_NEED
+from desktop.regime import read as read_regime
 from desktop.oi_feed import release_memory as release_oi
 from desktop.market import (
     CHART_BARS,
@@ -1257,6 +1262,7 @@ POSITION_COLUMNS = (
     "Coin", "Yön", "Boyut", "Giriş", "Breakeven", "Mark", "PnL", "Likidasyon",
     "Marjin", "Kaldıraç", "TP", "SL", "Trailing", "Kaynak", "İşlem",
 )
+ORDER_COLUMNS = ("Coin", "Yön", "Tür", "Fiyat", "Miktar", "Durum", "İşlem")
 LIQ_NEAR = QColor("#ff9800")
 
 
@@ -3647,11 +3653,23 @@ class _OkxPositions(QThread):
         try:
             positions = fetch_positions(self._creds, self._simulated)
             available = okx_available(self._creds, self._simulated)
-            self.done.emit({"positions": positions, "available": available})
         except OkxError as exc:
             self.failed.emit(str(exc))
+            return
         except Exception:
             self.failed.emit("Pozisyonlar okunamadı")
+            return
+        orders: list[dict] = []
+        order_error = ""
+        try:
+            orders = fetch_open_orders(self._creds, self._simulated)
+        except OkxError as exc:
+            order_error = str(exc)
+        except Exception:
+            order_error = "Bekleyen emirler okunamadı"
+        self.done.emit(
+            {"positions": positions, "available": available, "orders": orders, "order_error": order_error}
+        )
 
 
 class _OkxAction(QThread):
@@ -3688,6 +3706,8 @@ class _OkxAction(QThread):
                     self._simulated,
                     limit,
                 )
+            elif job.get("kind") == "cancel":
+                result = okx_cancel_order(self._creds, job["order"], self._simulated)
             elif job.get("kind") == "tpsl":
                 result = okx_set_tp_sl(self._creds, job["position"], job.get("tp"), job.get("sl"), self._simulated)
             else:
@@ -3740,21 +3760,6 @@ def _episode_text(snapshot: Snapshot, event: _SignalEvent, window) -> str:
         "Take profit yok" if tp is None else f"Take profit {_format_tp(tp)}",
         "Hedef fiyat yok" if event.target is None else f"Hedef fiyat {format_price(event.target)}",
     ]
-    if event.kind != "yeni":
-        return "\n".join(lines)
-    opened = None if window is None else window.closed_ms
-    bar_ms = SIGNAL_BAR_MS.get(event.label, 0)
-    close_ms = int(opened) + bar_ms if isinstance(opened, (int, float)) and float(opened) > 0 and bar_ms else int(time.time() * 1000)
-    found, level = signal_stop_level(
-        snapshot.symbol,
-        event.label,
-        close_ms,
-        snapshot.price,
-        _trade_side(event.verdict),
-    )
-    if not found:
-        return "\n".join(lines)
-    lines.append("Stop loss yok" if level is None else f"Stop loss {format_price(level)}")
     return "\n".join(lines)
 
 
@@ -4061,11 +4066,12 @@ class _TradeFeed(QObject):
 
 
 class _SignalEvent:
-    def __init__(self, label: str, kind: str, verdict: str, target: float | None) -> None:
+    def __init__(self, label: str, kind: str, verdict: str, target: float | None, stop: float | None = None) -> None:
         self.label = label
         self.kind = kind
         self.verdict = verdict
         self.target = target
+        self.stop = stop
 
 
 def _tp_stays_beyond(side: str | None, level, price) -> bool:
@@ -4128,6 +4134,25 @@ def _trade_side(verdict: str) -> str | None:
     return None
 
 
+def _trade_return(side, entry, exit_px) -> float | None:
+    """İşlem yönünde fiyat getirisi, yüzde. Long yükseliş, short düşüş artıdır."""
+    if side not in ("up", "down"):
+        return None
+    if not isinstance(entry, (int, float)) or float(entry) <= 0:
+        return None
+    if not isinstance(exit_px, (int, float)) or float(exit_px) <= 0:
+        return None
+    if side == "up":
+        return (float(exit_px) - float(entry)) / float(entry) * 100
+    return (float(entry) - float(exit_px)) / float(entry) * 100
+
+
+def _score_note(label: str, kind: str, episode, exit_px) -> tuple:
+    side = episode.get("side") if isinstance(episode, dict) else None
+    entry = episode.get("entry") if isinstance(episode, dict) else None
+    return (label, kind, _trade_return(side, entry, exit_px))
+
+
 def _episode_open(verdict: str, target, candle: int, spot) -> dict:
     side = _trade_side(verdict)
     entry_px = float(spot) if isinstance(spot, (int, float)) and float(spot) > 0 else None
@@ -4144,6 +4169,29 @@ def _episode_open(verdict: str, target, candle: int, spot) -> dict:
         "candle": candle,
         "opened_ms": int(time.time() * 1000),
     }
+
+
+def _trap_limits(side: str | None, price: float, level: float) -> tuple[float, float] | None:
+    """Ters kovaya doğru iki limit. Long Trap üstte, Short Trap altta. Yanlış taraftaysa yok."""
+    if side == "down":
+        inner = level - TP_OFFSET
+        if inner <= price:
+            return None
+    elif side == "up":
+        inner = level + TP_OFFSET
+        if inner >= price or inner <= 0:
+            return None
+    else:
+        return None
+    mid = (price + inner) / 2
+    if price >= 1:
+        inner = float(round(inner))
+        mid = float(round(mid))
+    if side == "down" and not (price < mid < inner):
+        return None
+    if side == "up" and not (inner < mid < price):
+        return None
+    return mid, inner
 
 
 def _signal_clock(opened_ms) -> str:
@@ -4295,7 +4343,7 @@ def _advance_signal(
                         float(shown) if isinstance(shown, (int, float)) and float(shown) > 0 else None,
                     )
                 )
-                notes.append((label, "hit"))
+                notes.append(_score_note(label, "hit", episode, tp))
                 entry[label] = _tp_rest(label, str(episode["verdict"]), closed_ms)
                 continue
         if same_candle and not (
@@ -4315,11 +4363,11 @@ def _advance_signal(
             if hit:
                 shown = float(target) if isinstance(target, (int, float)) and float(target) > 0 else None
                 events.append(_SignalEvent(label, "kapandi", str(episode["verdict"]), shown))
-                notes.append((label, "hit"))
+                notes.append(_score_note(label, "hit", episode, tp))
                 entry[label] = _tp_rest(label, str(episode["verdict"]), closed_ms)
                 continue
             if _signal_expired(label, episode):
-                notes.append((label, "miss"))
+                notes.append(_score_note(label, "miss", episode, spot))
                 failed = str(episode.get("verdict") or "")
                 shown = episode.get("target")
                 failed_target = float(shown) if isinstance(shown, (int, float)) and float(shown) > 0 else None
@@ -4421,7 +4469,7 @@ def _advance_signal(
             entry[label] = kept
             continue
         if episode.get("verdict"):
-            notes.append((label, "miss"))
+            notes.append(_score_note(label, "miss", episode, spot))
         entry[label] = _episode_open(verdict, target, closed_ms, spot)
         events.append(_SignalEvent(label, "yeni", verdict, target))
     if not dirty:
@@ -4431,11 +4479,14 @@ def _advance_signal(
     return book, events, notes
 
 
-def _bump_score(raw, symbol: str, notes: list[tuple[str, str]]) -> dict:
-    """Kapanan sinyali coin ve aralık bazında doğru ya da yanlış sayar."""
+def _bump_score(raw, symbol: str, notes: list[tuple]) -> dict:
+    """Kapanan sinyali coin ve aralık bazında doğru ya da yanlış sayar. Getiriyi de toplar."""
     score = dict(raw) if isinstance(raw, dict) else {}
     entry = dict(score.get(symbol) or {})
-    for label, kind in notes:
+    for item in notes:
+        label = item[0]
+        kind = item[1]
+        pnl = item[2] if len(item) > 2 else None
         if kind not in ("hit", "miss") or label not in SIGNAL_WINDOWS:
             continue
         row = dict(entry.get(label) or {})
@@ -4444,6 +4495,12 @@ def _bump_score(raw, symbol: str, notes: list[tuple[str, str]]) -> dict:
         except (TypeError, ValueError):
             count = 0
         row[kind] = count + 1
+        if isinstance(pnl, (int, float)):
+            try:
+                carried = float(row.get("pnl") or 0)
+            except (TypeError, ValueError):
+                carried = 0.0
+            row["pnl"] = carried + float(pnl)
         entry[label] = row
     score[symbol] = entry
     return score
@@ -4515,7 +4572,33 @@ def _score_line(raw, label: str) -> str:
     closed = hit + miss
     if closed <= 0:
         return "doğruluk henüz yok"
-    return f"TP doğru {hit}/{closed} · %{round(100 * hit / closed)}"
+    line = f"TP doğru {hit}/{closed} · %{round(100 * hit / closed)}"
+    if isinstance(row, dict) and "pnl" in row:
+        try:
+            total = float(row.get("pnl") or 0)
+        except (TypeError, ValueError):
+            total = 0.0
+        line += f" · getiri {total:+.1f}%"
+    return line
+
+
+def _score_total(raw) -> str:
+    if not isinstance(raw, dict):
+        return ""
+    total = 0.0
+    seen = False
+    for label in SIGNAL_WINDOWS:
+        row = raw.get(label)
+        if not isinstance(row, dict) or "pnl" not in row:
+            continue
+        try:
+            total += float(row.get("pnl") or 0)
+        except (TypeError, ValueError):
+            continue
+        seen = True
+    if not seen:
+        return ""
+    return f"toplam getiri {total:+.1f}%"
 
 
 def _price_window(lows: list[float], highs: list[float], step: float) -> tuple[float, float] | None:
@@ -5426,212 +5509,31 @@ def _tsi_clock(stamp_ms: int) -> str:
     return f"{moment:%H:%M}"
 
 
-class _VolumeBoard(QWidget):
-    """Seans histogramları tek fiyat cetvelinde. Çubuklar sağdan sola büyür."""
 
-    def __init__(self) -> None:
-        super().__init__()
-        self._profiles: list[VolumeProfile] = []
-        self._message = ""
-        self._price: float | None = None
-        self._rising = True
-        self.setMinimumHeight(280)
-
-    def set_profiles(self, profiles: list[VolumeProfile]) -> None:
-        self._profiles = list(profiles)
-        self._message = ""
-        self.update()
-
-    def set_message(self, text: str) -> None:
-        self._message = text
-        if text:
-            self._profiles = []
-        self.update()
-
-    def set_last(self, price: float | None, rising: bool) -> None:
-        self._price = None if price is None else float(price)
-        self._rising = bool(rising)
-        self.update()
-
-    def paintEvent(self, _event) -> None:
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#0b0b0d"))
-        if self._message and not self._profiles:
-            painter.setPen(MUTED)
-            painter.setFont(QFont("Segoe UI", 13))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._message)
-            painter.end()
-            return
-        profiles = self._profiles
-        if not profiles:
-            painter.end()
-            return
-        axis_w = 84.0
-        margin = 8.0
-        header_h = 48.0
-        plot = QRectF(margin, header_h, max(1.0, self.width() - margin * 2 - axis_w), max(1.0, self.height() - header_h - 10))
-        if plot.width() < 40 or plot.height() < 40:
-            painter.end()
-            return
-        low, high = self._span(profiles)
-        if low is None or high is None:
-            for index, profile in enumerate(profiles):
-                left = margin + index * ((self.width() - margin * 2) / max(len(profiles), 1))
-                width = (self.width() - margin * 2) / max(len(profiles), 1)
-                self._paint_column(painter, profile, QRectF(left, header_h, max(1.0, width - 10), 40), lambda _price: header_h)
-            painter.end()
-            return
-        span = high - low
-
-        def y_of(price: float) -> float:
-            return plot.top() + (high - price) / span * plot.height()
-
-        painter.fillRect(QRectF(plot.right(), plot.top(), axis_w + margin, plot.height()), QColor("#18181b"))
-        painter.setPen(QPen(QColor("#27272a"), 1))
-        step = _tick_step(span)
-        tick = math.ceil(low / step - 1e-9) * step
-        guard = 0
-        while tick <= high + step * 1e-9 and guard < 24:
-            y = y_of(tick)
-            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
-            tick += step
-            guard += 1
-        count = len(profiles)
-        gap = 10.0
-        col_w = (plot.width() - gap * (count - 1)) / count
-        for index, profile in enumerate(profiles):
-            left = plot.left() + index * (col_w + gap)
-            self._paint_column(painter, profile, QRectF(left, plot.top(), col_w, plot.height()), y_of)
-        painter.setPen(MUTED)
-        painter.setFont(QFont("Consolas", 8))
-        tick = math.ceil(low / step - 1e-9) * step
-        guard = 0
-        while tick <= high + step * 1e-9 and guard < 24:
-            y = y_of(tick)
-            painter.drawText(QRectF(plot.right() + 6, y - 8, axis_w - 10, 16), Qt.AlignmentFlag.AlignLeft, format_price(tick))
-            tick += step
-            guard += 1
-        self._paint_last(painter, plot, y_of)
-        painter.end()
-
-    def _span(self, profiles: list[VolumeProfile]) -> tuple[float | None, float | None]:
-        lows: list[float] = []
-        highs: list[float] = []
-        for profile in profiles:
-            if not profile.rows:
-                continue
-            lows.append(profile.rows[0].low)
-            highs.append(profile.rows[-1].high)
-        if self._price is not None:
-            lows.append(self._price)
-            highs.append(self._price)
-        if not lows:
-            return None, None
-        low = min(lows)
-        high = max(highs)
-        pad = (high - low) * 0.04 if high > low else max(abs(low) * 0.01, 1.0)
-        return low - pad, high + pad
-
-    def _paint_column(self, painter: QPainter, profile: VolumeProfile, column: QRectF, y_of) -> None:
-        title = profile.name
-        if profile.developing:
-            title += " · sürüyor"
-        elif not profile.note:
-            title += " · kapandı"
-        painter.setPen(QColor("#fafafa"))
-        painter.setFont(QFont("Segoe UI", 11, QFont.Weight.DemiBold))
-        shown_title = painter.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, int(column.width()))
-        painter.drawText(QRectF(column.left(), 6, column.width(), 20), Qt.AlignmentFlag.AlignLeft, shown_title)
-        clock = f"{_tsi_clock(profile.start_ms)}–{_tsi_clock(profile.end_ms)} TSI (UTC+3)"
-        painter.setPen(MUTED)
-        painter.setFont(QFont("Consolas", 8))
-        shown = painter.fontMetrics().elidedText(clock, Qt.TextElideMode.ElideRight, int(column.width()))
-        painter.drawText(QRectF(column.left(), 26, column.width(), 16), Qt.AlignmentFlag.AlignLeft, shown)
-        if profile.note or not profile.rows:
-            painter.drawText(
-                QRectF(column.left(), column.top() + 12, column.width(), 24),
-                Qt.AlignmentFlag.AlignLeft,
-                profile.note or "veri yok",
-            )
-            return
-        if profile.val is not None and profile.vah is not None:
-            band_top = y_of(profile.vah)
-            band_bottom = y_of(profile.val)
-            painter.fillRect(QRectF(column.left(), band_top, column.width(), band_bottom - band_top), QColor(41, 98, 255, 28))
-        widest = max(row.total for row in profile.rows) or 1.0
-        right = column.right()
-        for row in profile.rows:
-            y1 = y_of(row.high)
-            y2 = y_of(row.low)
-            height = max(1.0, y2 - y1 - 1.0)
-            width = (row.total / widest) * column.width() * (2.0 / 3.0) if row.total > 0 else 0.0
-            inside = (
-                profile.val is not None
-                and profile.vah is not None
-                and row.low >= profile.val - 1e-9
-                and row.high <= profile.vah + 1e-9
-            )
-            up_color = QColor("#60a5fa") if inside else QColor("#3f3f46")
-            down_color = QColor("#f5c451") if inside else QColor("#71717a")
-            up_width = width * (row.up / row.total) if row.total else 0.0
-            painter.fillRect(QRectF(right - up_width, y1, up_width, height), up_color)
-            painter.fillRect(QRectF(right - width, y1, max(0.0, width - up_width), height), down_color)
-            if row.kind and column.width() - width >= 36:
-                painter.setPen(QColor("#93c5fd") if row.kind == "HVN" else QColor("#d4d4d8"))
-                painter.drawText(
-                    QRectF(column.left(), y1 - 2, max(0.0, column.width() - width - 4), height + 4),
-                    Qt.AlignmentFlag.AlignRight,
-                    row.kind,
-                )
-        painter.setFont(QFont("Consolas", 8))
-        for price, label, color in (
-            (profile.vah, "VAH", "#60a5fa"),
-            (profile.poc, "POC", "#f5c451"),
-            (profile.val, "VAL", "#60a5fa"),
-        ):
-            if price is None:
-                continue
-            y = y_of(price)
-            painter.setPen(QColor(color))
-            painter.drawLine(QPointF(column.left(), y), QPointF(column.right(), y))
-            painter.drawText(QRectF(column.left() + 2, y - 14, 36, 14), Qt.AlignmentFlag.AlignLeft, label)
-
-    def _paint_last(self, painter: QPainter, plot: QRectF, y_of) -> None:
-        if self._price is None:
-            return
-        y = y_of(self._price)
-        if y < plot.top() - 1 or y > plot.bottom() + 1:
-            return
-        color = UP if self._rising else DOWN
-        pen = QPen(color)
-        pen.setCosmetic(True)
-        pen.setStyle(Qt.PenStyle.CustomDashLine)
-        pen.setDashPattern([4, 3])
-        painter.setPen(pen)
-        painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
-        rect = QRectF(plot.right() + 4, y - 9, 76, 18)
-        painter.fillRect(rect, color)
-        painter.setPen(QColor("#0b0b0d"))
-        painter.setFont(QFont("Consolas", 8))
-        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, format_price(self._price))
-
-
-class _VolumeWorker(QThread):
+class _RegimeWorker(QThread):
     done = Signal(object)
-    failed = Signal(str)
 
-    def __init__(self, symbol: str, span: str) -> None:
+    def __init__(self, symbol: str, interval: str, generation: int) -> None:
         super().__init__()
         self._symbol = symbol
-        self._span = span
+        self._interval = interval
+        self._generation = generation
 
     def run(self) -> None:
+        row = None
         try:
-            self.done.emit(load_profile(self._symbol, self._span))
-        except MarketError as exc:
-            self.failed.emit(str(exc))
-        except Exception as exc:
-            self.failed.emit(str(exc) or "hacim profili alınamadı")
+            bars = fetch_klines(self._symbol, self._interval, REGIME_NEED, True)
+            row = read_regime([bar.close for bar in bars])
+        except Exception:
+            row = None
+        self.done.emit(
+            {
+                "generation": self._generation,
+                "symbol": self._symbol,
+                "interval": self._interval,
+                "row": row,
+            }
+        )
 
 
 class MainWindow(QMainWindow):
@@ -5655,10 +5557,8 @@ class MainWindow(QMainWindow):
         self._clip_worker: _ClipWorker | None = None
         self._clip_gen = 0
         self._liq_candle: tuple[str, int] | None = None
-        self._volume_worker: _VolumeWorker | None = None
-        self._volume_gen = 0
-        saved_volume = _read_state().get("volume_range")
-        self._volume_range = saved_volume if saved_volume in {key for key, _label in VOLUME_RANGES} else "gunluk"
+        self._regime_worker: _RegimeWorker | None = None
+        self._regime_gen = 0
         saved_span = _read_state().get("liq_span")
         self._liq_span = int(saved_span) if saved_span in {hours for hours, _label in LIQ_SPANS} else 72
         saved_threshold = _read_state().get("liq_threshold")
@@ -5690,6 +5590,9 @@ class MainWindow(QMainWindow):
         self._okx_wait: list[dict] = []
         self._okx_live: list[dict] = []
         self._okx_live_error = ""
+        self._okx_orders: list[dict] = []
+        self._okx_order_error = ""
+        self._okx_order_keys: list[str] = []
         self._okx_available: float | None = None
         self._okx_liq_at = 0.0
         self._okx_polled = 0.0
@@ -6250,6 +6153,89 @@ class MainWindow(QMainWindow):
         self._chart_caption.adjustSize()
         self._chart_caption.move(8, 4)
         self._chart_caption.raise_()
+        table = getattr(self, "_trend_table", None)
+        if table is not None:
+            table.adjustSize()
+            table.move(8, self._chart_caption.height() + 8)
+            table.raise_()
+
+    def _build_trend_table(self) -> None:
+        frame = QFrame(self.price_view.viewport())
+        frame.setObjectName("trendTable")
+        frame.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        frame.setStyleSheet(
+            "QFrame#trendTable { background: rgba(39, 39, 42, 230); border-radius: 5px; }"
+            "QLabel { color: #e4e4e7; background: transparent; font-size: 11px; font-family: Consolas, monospace; }"
+        )
+        grid = QGridLayout(frame)
+        grid.setContentsMargins(8, 6, 10, 6)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(1)
+        title = QLabel("trend")
+        title.setStyleSheet("color: #fafafa; font-size: 12px; font-weight: 600; background: transparent;")
+        grid.addWidget(title, 0, 0, 1, 2)
+        self._trend_cells: dict[str, QLabel] = {}
+        for row, key, label in (
+            (1, "rejim", "rejim"),
+            (2, "er", "ER"),
+            (3, "band", "bant"),
+            (4, "squeeze", "sıkışma"),
+        ):
+            name = QLabel(label)
+            name.setStyleSheet("color: #a1a1aa; font-size: 11px; background: transparent;")
+            value = QLabel("—")
+            grid.addWidget(name, row, 0)
+            grid.addWidget(value, row, 1)
+            self._trend_cells[key] = value
+        self._trend_table = frame
+        self._place_caption()
+
+    def _paint_trend(self, row) -> None:
+        cells = getattr(self, "_trend_cells", None)
+        if not cells:
+            return
+        if not isinstance(row, dict):
+            cells["rejim"].setText("yok")
+            cells["er"].setText("—")
+            cells["band"].setText("—")
+            cells["squeeze"].setText("—")
+        else:
+            names = {"trend": "trend", "yatay": "yatay", "gecis": "geçiş"}
+            cells["rejim"].setText(names.get(str(row.get("name") or ""), "geçiş"))
+            er = row.get("er")
+            cells["er"].setText("—" if not isinstance(er, (int, float)) else f"{float(er):.2f}")
+            rank = row.get("bw_rank")
+            cells["band"].setText("—" if not isinstance(rank, (int, float)) else f"%{round(float(rank) * 100)}")
+            cells["squeeze"].setText("var" if row.get("squeeze") else "yok")
+        self._place_caption()
+
+    def _ensure_regime(self) -> None:
+        if not hasattr(self, "_trend_table"):
+            return
+        if self._background or is_index(self._symbol) or self._interval not in CHART_INTERVALS:
+            self._paint_trend(None)
+            return
+        worker = self._regime_worker if self._thread_running("_regime_worker") else None
+        if (
+            worker is not None
+            and getattr(worker, "_symbol", None) == self._symbol
+            and getattr(worker, "_interval", None) == self._interval
+        ):
+            return
+        self._regime_gen += 1
+        generation = self._regime_gen
+        symbol = self._symbol
+        interval = self._interval
+        worker = _RegimeWorker(symbol, interval, generation)
+        worker.done.connect(lambda payload, gen=generation: self._on_regime(gen, payload))
+        self._launch(worker, "_regime_worker")
+
+    def _on_regime(self, generation: int, payload: object) -> None:
+        if self._background or not isinstance(payload, dict):
+            return
+        if generation != self._regime_gen or payload.get("symbol") != self._symbol or payload.get("interval") != self._interval:
+            return
+        self._paint_trend(payload.get("row"))
 
     def eventFilter(self, watched, event):
         if watched is getattr(self, "price_view", None) and event.type() == QEvent.Type.Resize:
@@ -6448,14 +6434,10 @@ class MainWindow(QMainWindow):
         self._page_group.setExclusive(True)
         self._page_market = QPushButton("Piyasa")
         self._page_liq = QPushButton("Likidasyon")
-        self._page_volume = QPushButton("Hacim")
-        self._page_limit = QPushButton("Limit")
         self._page_exchange = QPushButton("Borsa")
         for button, page, checked in (
             (self._page_market, "market", True),
             (self._page_liq, "liq", False),
-            (self._page_volume, "volume", False),
-            (self._page_limit, "limit", False),
             (self._page_exchange, "exchange", False),
         ):
             button.setObjectName("page")
@@ -6541,6 +6523,7 @@ class MainWindow(QMainWindow):
         caption_layout.addWidget(self._chart_title)
         caption_layout.addLayout(self._indicator_rows)
         self.price_view.installEventFilter(self)
+        self._build_trend_table()
 
         self.oi_chart = QChart()
         self.oi_x, self.oi_y = _prepare_chart(self.oi_chart, "Open interest")
@@ -6665,116 +6648,11 @@ class MainWindow(QMainWindow):
         self._right_stack = QStackedWidget()
         self._right_stack.addWidget(market_page)
         self._right_stack.addWidget(heat_page)
-        self._right_stack.addWidget(self._build_volume_page())
-        self._right_stack.addWidget(self._build_limit_page())
         self._right_stack.addWidget(self._build_exchange())
         self._right_stack.setCurrentIndex(0)
         column.addWidget(self._right_stack, 1)
         return panel
 
-    def _build_volume_page(self) -> QWidget:
-        page = QWidget()
-        page.setStyleSheet("background: #0b0b0d;")
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
-        bar = QHBoxLayout()
-        bar.setContentsMargins(8, 8, 8, 0)
-        bar.addStretch(1)
-        self._volume_range_box = QComboBox()
-        self._volume_range_box.setMinimumWidth(120)
-        for key, label in VOLUME_RANGES:
-            self._volume_range_box.addItem(label, key)
-        current = next((index for index, (key, _label) in enumerate(VOLUME_RANGES) if key == self._volume_range), 3)
-        self._volume_range_box.blockSignals(True)
-        self._volume_range_box.setCurrentIndex(current)
-        self._volume_range_box.blockSignals(False)
-        self._volume_range_box.currentIndexChanged.connect(self._on_volume_range)
-        bar.addWidget(self._volume_range_box, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        layout.addLayout(bar)
-        self._volume_board = _VolumeBoard()
-        layout.addWidget(self._volume_board, 1)
-        self._volume_shown = ("", "")
-        return page
-
-    def _build_limit_page(self) -> QWidget:
-        page = QWidget()
-        page.setStyleSheet("background: #0b0b0d;")
-        layout = QVBoxLayout(page)
-        note = QLabel("Limit emir haritası sonra eklenecek")
-        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        note.setStyleSheet("color: #a1a1aa; font-size: 14px; background: transparent;")
-        layout.addWidget(note)
-        return page
-
-    def _show_volume_note(self, text: str) -> None:
-        self._volume_board.set_message(text)
-
-    def _sync_volume_price(self, price: float | None = None, rising: bool | None = None, *, clear: bool = False) -> None:
-        board = getattr(self, "_volume_board", None)
-        if board is None:
-            return
-        if clear:
-            board.set_last(None, True)
-            return
-        if price is None:
-            price = self._live_price if self._live_price is not None else board._price
-        if price is None:
-            return
-        board.set_last(price, self._live_up if rising is None else rising)
-
-    def _on_volume_range(self, _index: int) -> None:
-        key = str(self._volume_range_box.currentData() or "")
-        if key not in {item for item, _label in VOLUME_RANGES} or key == self._volume_range:
-            return
-        self._volume_range = key
-        _patch_state(volume_range=key)
-        self._ensure_volume()
-
-    def _ensure_volume(self) -> None:
-        if self._background:
-            return
-        if getattr(self, "_page", "") != "volume" or not hasattr(self, "_volume_board"):
-            return
-        if is_index(self._symbol):
-            self._volume_shown = ("", "")
-            self._show_volume_note("Bu coin için hacim profili yok")
-            return
-        span = self._volume_range
-        if self._volume_shown != (self._symbol, span):
-            self._show_volume_note("Yükleniyor")
-        if self._thread_running("_volume_worker"):
-            worker = self._volume_worker
-            if worker is not None and getattr(worker, "_symbol", None) == self._symbol and getattr(worker, "_span", None) == span:
-                return
-        self._volume_gen += 1
-        generation = self._volume_gen
-        symbol = self._symbol
-        worker = _VolumeWorker(symbol, span)
-        worker.done.connect(
-            lambda payload, gen=generation, chosen=symbol, picked=span: self._on_volume(gen, chosen, picked, payload)
-        )
-        worker.failed.connect(
-            lambda message, gen=generation, chosen=symbol, picked=span: self._on_volume_fail(gen, chosen, picked, message)
-        )
-        self._launch(worker, "_volume_worker")
-
-    def _on_volume(self, generation: int, symbol: str, span: str, profile: object) -> None:
-        if self._background or generation != self._volume_gen or symbol != self._symbol or span != self._volume_range or self._page != "volume":
-            return
-        if not isinstance(profile, VolumeProfile):
-            self._show_volume_note("veri yok")
-            return
-        self._volume_shown = (symbol, span)
-        self._volume_board.set_profiles([profile])
-        self._sync_volume_price()
-
-    def _on_volume_fail(self, generation: int, symbol: str, span: str, message: str) -> None:
-        if generation != self._volume_gen or symbol != self._symbol or span != self._volume_range or self._page != "volume":
-            return
-        if self._volume_shown == (symbol, span):
-            return
-        self._show_volume_note(message or "hacim profili alınamadı")
 
     def _build_exchange(self) -> QWidget:
         data = _read_state()
@@ -6948,7 +6826,29 @@ class MainWindow(QMainWindow):
         self._okx_live_note = QLabel("")
         self._okx_live_note.setStyleSheet("color: #a1a1aa;")
         column.addWidget(self._okx_live_note)
+        orders_title = QLabel("Bekleyen emirler")
+        orders_title.setObjectName("metricTitle")
+        column.addWidget(orders_title)
+        orders = QTableWidget(0, len(ORDER_COLUMNS))
+        orders.setHorizontalHeaderLabels(list(ORDER_COLUMNS))
+        orders.verticalHeader().setVisible(False)
+        orders.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        orders.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        orders.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        orders.setMinimumHeight(90)
+        orders.setMaximumHeight(180)
+        order_header = orders.horizontalHeader()
+        order_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        for name in ("Tür", "Durum", "İşlem"):
+            order_header.setSectionResizeMode(ORDER_COLUMNS.index(name), QHeaderView.ResizeMode.ResizeToContents)
+        orders.itemDoubleClicked.connect(self._open_order_chart)
+        self._okx_orders_table = orders
+        column.addWidget(orders)
+        self._okx_order_note = QLabel("")
+        self._okx_order_note.setStyleSheet("color: #a1a1aa;")
+        column.addWidget(self._okx_order_note)
         self._render_okx_positions()
+        self._render_okx_orders()
         self._refresh_okx_cap()
         return panel
 
@@ -7364,15 +7264,13 @@ class MainWindow(QMainWindow):
         if page == "liq" and is_index(self._symbol):
             self._page_market.setChecked(True)
             page = "market"
-        index = {"market": 0, "liq": 1, "volume": 2, "limit": 3, "exchange": 4}.get(page, 0)
+        index = {"market": 0, "liq": 1, "exchange": 2}.get(page, 0)
         self._page = page
         self._right_stack.setCurrentIndex(index)
         if hasattr(self, "_heat"):
             self._heat.set_live(page == "liq" and not self._background)
         if page == "liq":
             self._ensure_liquidity(False)
-        if page == "volume":
-            self._ensure_volume()
 
     def _stamp_liq_candle(self) -> None:
         """Aralık değişince bir sonraki kapanış beklenir. Yükleme bitince de aynı mum yazılır."""
@@ -7582,7 +7480,6 @@ class MainWindow(QMainWindow):
     def _paint_active(self) -> None:
         if not hasattr(self, "_active_signal_box"):
             return
-        self._active_title.setText(f"Aktif işlem · {base_of(self._symbol)}")
         stored = _read_state().get("signal_open")
         entry = stored.get(self._symbol) if isinstance(stored, dict) else None
         if not isinstance(entry, dict):
@@ -7591,6 +7488,9 @@ class MainWindow(QMainWindow):
         coin = score.get(self._symbol) if isinstance(score, dict) else {}
         if not isinstance(coin, dict):
             coin = {}
+        title = f"Aktif işlem · {base_of(self._symbol)}"
+        total = _score_total(coin)
+        self._active_title.setText(f"{title} · {total}" if total else title)
         signal_rows: list[tuple[str, str, str, str]] = []
         for label in SIGNAL_WINDOWS:
             episode = entry.get(label) if isinstance(entry.get(label), dict) else {}
@@ -7646,7 +7546,6 @@ class MainWindow(QMainWindow):
     def _show_symbol(self, symbol: str) -> None:
         self._live_price = None
         self._live_set = None
-        self._sync_volume_price(clear=True)
         self._limit_edited = False
         if hasattr(self, "_okx_limit"):
             self._okx_limit.clear()
@@ -7682,11 +7581,11 @@ class MainWindow(QMainWindow):
             self._history_done = True
             self.statusBar().showMessage(f"{index_label(symbol)} güncelleniyor")
             self._start_index(True)
-            self._ensure_volume()
+            self._paint_trend(None)
             return
         self.statusBar().showMessage(f"{symbol} güncelleniyor")
         self._ensure_liquidity(True)
-        self._ensure_volume()
+        self._ensure_regime()
         self._refresh_okx_cap()
 
     def _set_interval(self, interval: str) -> None:
@@ -7698,6 +7597,7 @@ class MainWindow(QMainWindow):
         _save_state(self._symbol, self._interval)
         self._paint_interval_menu()
         self.price_view.mark_fresh()
+        self._ensure_regime()
         self._start_snapshot(force=True)
 
     def _feed_symbols(self) -> list[str]:
@@ -7747,7 +7647,7 @@ class MainWindow(QMainWindow):
 
     def _release_tray_memory(self) -> None:
         """Görünen seriler ve birikmiş önbellekler bırakılır. Saatlik sinyal durmaz."""
-        self._volume_gen += 1
+        self._regime_gen += 1
         self._liq_gen += 1
         self._clip_gen += 1
         self._history_gen += 1
@@ -7759,7 +7659,6 @@ class MainWindow(QMainWindow):
         self._index_quote_map = {}
         self._funding_shown = []
         self._funding_drawn = None
-        self._volume_shown = ("", "")
         self._liq_full = None
         self._liq_map = None
         self._liq_clips = {}
@@ -7774,10 +7673,6 @@ class MainWindow(QMainWindow):
             self.oi_chart.removeAllSeries()
         if hasattr(self, "funding_chart"):
             self.funding_chart.removeAllSeries()
-        board = getattr(self, "_volume_board", None)
-        if board is not None:
-            board.set_profiles([])
-            board.set_last(None, True)
         heat = getattr(self, "_heat", None)
         if heat is not None:
             heat.set_candles([])
@@ -7812,11 +7707,6 @@ class MainWindow(QMainWindow):
         self._quitting = True
         self._tray.hide()
         self.close()
-
-    def changeEvent(self, event) -> None:
-        if event.type() == QEvent.Type.WindowStateChange and not self._quitting and self.isMinimized():
-            QTimer.singleShot(0, self._enter_background)
-        super().changeEvent(event)
 
     def _on_tick(self) -> None:
         if self._background:
@@ -8145,7 +8035,6 @@ class MainWindow(QMainWindow):
             return
         self.heading.setText(snapshot.base)
         self.header_price.setText(format_price(snapshot.price))
-        self._sync_volume_price(snapshot.price, (snapshot.session_change or 0) >= 0)
         self._session_change = snapshot.session_change
         self._paint_change()
         self._paint(self._cards["price"][0], format_price(snapshot.price), "flat")
@@ -8209,10 +8098,9 @@ class MainWindow(QMainWindow):
             message = f"{message}  ·  {snapshot.warning}"
         self.statusBar().showMessage(message)
         self._ensure_liquidity(False)
+        self._ensure_regime()
         if self._page == "liq":
             self._load_liq_candles()
-        if self._page == "volume":
-            self._ensure_volume()
 
     def _fill_windows(self, snapshot: Snapshot) -> None:
         self.analysis.setRowCount(len(snapshot.windows))
@@ -8391,7 +8279,6 @@ class MainWindow(QMainWindow):
         self._live_up = last.close >= last.open
         self._live_set = self._drawn_sets.get(int(last.time_ms))
         self.price_view.set_last_price(last.time_ms, last.close, last.close >= last.open)
-        self._sync_volume_price(last.close, last.close >= last.open)
         self.price_view.set_bands(self._band_points)
         self._sync_signals()
         self._note_price_home()
@@ -8524,6 +8411,23 @@ class MainWindow(QMainWindow):
                 return level
         return None
 
+    def _trap_bucket(self, verdict: str, hours: int, price: float) -> float | None:
+        """Take profit'in haritasında, işlemin ters tarafındaki en büyük kova."""
+        side = _trade_side(verdict)
+        flip = "up" if side == "down" else "down" if side == "up" else None
+        if flip is None or price <= 0:
+            return None
+        ladder = (24, 72, 168, 720)
+        spans = ladder[ladder.index(hours):] if hours in ladder else (hours,)
+        for span in spans:
+            table = self._liq_targets.get((span, self._liq_conserved))
+            if table is None or table.symbol != self._symbol:
+                continue
+            if table.pick(side, price) is None:
+                continue
+            return table.pick(flip, price)
+        return None
+
     def _flush_held_signal(self) -> None:
         """Coin değişince bekleyen sinyali duran haritayla kapatır."""
         snapshot = getattr(self, "_held_signal", None)
@@ -8598,6 +8502,8 @@ class MainWindow(QMainWindow):
         book, events, notes = _advance_signal(
             book, snapshot.symbol, candles, verdicts, targets, snapshot.price, touches
         )
+        if snapshot.symbol == DECISION_SYMBOL and any(event.kind == "yeni" for event in events):
+            self._liq_tape.note_signal(int(time.time() * 1000), snapshot.price)
         current = book.get(snapshot.symbol) if isinstance(book.get(snapshot.symbol), dict) else {}
 
         def _stamp(entry: dict, label: str):
@@ -8788,15 +8694,25 @@ class MainWindow(QMainWindow):
             tp = episode.get("tp")
             entry = episode.get("entry")
             spot = float(entry) if isinstance(entry, (int, float)) and float(entry) > 0 else price
-            actions.append(
-                {
-                    "op": "open",
-                    "label": event.label,
-                    "side": episode.get("side"),
-                    "tp": tp,
-                    "price": spot,
-                }
-            )
+            action = {
+                "op": "open",
+                "label": event.label,
+                "side": episode.get("side"),
+                "tp": tp,
+                "price": spot,
+            }
+            if family in ("Long Trap", "Short Trap") and spot > 0:
+                hours = SIGNAL_LIQ_HOURS.get(event.label)
+                level = self._trap_bucket(event.verdict, hours, spot) if isinstance(hours, int) else None
+                if level is not None:
+                    limits = _trap_limits(episode.get("side"), spot, float(level))
+                    if limits is None:
+                        _okx_note(snapshot.symbol, event.label, "open", False, "emir gitmedi: ters likidite girişe çok yakın")
+                        self._show_okx_log()
+                        continue
+                    action["op"] = "scale"
+                    action["limits"] = [limits[0], limits[1]]
+            actions.append(action)
         if not actions:
             return
         payload = {
@@ -8907,6 +8823,10 @@ class MainWindow(QMainWindow):
                 self._okx_live_error = ""
                 self._render_okx_positions()
                 self._paint_position_lines()
+            if self._okx_orders or self._okx_order_error:
+                self._okx_orders = []
+                self._okx_order_error = ""
+                self._render_okx_orders()
             return
         if self._thread_running("_okx_positions_worker"):
             return
@@ -8926,7 +8846,13 @@ class MainWindow(QMainWindow):
         if isinstance(payload, dict) and isinstance(payload.get("available"), (int, float)):
             self._okx_available = float(payload["available"])
             self._paint_okx_size()
+        if isinstance(payload, dict):
+            self._okx_order_error = str(payload.get("order_error") or "")
+            if not self._okx_order_error:
+                found = payload.get("orders")
+                self._okx_orders = [row for row in found if isinstance(row, dict)] if isinstance(found, list) else []
         self._render_okx_positions()
+        self._render_okx_orders()
         self._paint_position_lines()
         self._paint_active()
 
@@ -8997,6 +8923,109 @@ class MainWindow(QMainWindow):
             total = sum(float(position.get("upl") or 0) for position in positions)
             self._okx_live_note.setText(f"Toplam PnL {total:+.2f} USDT")
             self._okx_live_note.setStyleSheet(f"color: {'#26a69a' if total >= 0 else '#ef5350'};")
+
+    def _render_okx_orders(self) -> None:
+        if not hasattr(self, "_okx_orders_table"):
+            return
+        table = self._okx_orders_table
+        orders = self._okx_orders
+        keys = [f"{order.get('inst')}|{order.get('ord_id')}" for order in orders]
+        if keys != self._okx_order_keys:
+            self._okx_order_keys = keys
+            table.setRowCount(len(orders))
+            for row, key in enumerate(keys):
+                for column in range(table.columnCount() - 1):
+                    item = QTableWidgetItem("")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    table.setItem(row, column, item)
+                table.setCellWidget(row, table.columnCount() - 1, self._okx_cancel_button(key))
+        for row, order in enumerate(orders):
+            side, kind, size = order_face(order)
+            buy = order.get("side") == "buy"
+            closing = "kapat" in side
+            state = "Kısmi" if order.get("state") == "partially_filled" else "Bekliyor"
+            cells = [
+                (base_of(str(order.get("symbol") or "")), FLAT),
+                (side, MUTED if closing else (UP if buy else DOWN)),
+                (kind, FLAT),
+                (_price_text(order.get("px")), FLAT),
+                (size, FLAT),
+                (state, FLAT),
+            ]
+            for column, (text, color) in enumerate(cells):
+                item = table.item(row, column)
+                if item is None:
+                    continue
+                if item.text() != text:
+                    item.setText(text)
+                if item.foreground().color() != color:
+                    item.setForeground(color)
+        if self._okx_order_error:
+            self._okx_order_note.setText(self._okx_order_error)
+            self._okx_order_note.setStyleSheet("color: #ef5350;")
+        elif not orders:
+            creds, _simulated = self._okx_account()
+            self._okx_order_note.setText("Bekleyen emir yok" if creds.ready() else "API bilgileri girilmedi")
+            self._okx_order_note.setStyleSheet("color: #a1a1aa;")
+        else:
+            self._okx_order_note.setText(f"{len(orders)} bekleyen emir")
+            self._okx_order_note.setStyleSheet("color: #a1a1aa;")
+
+    def _okx_order(self, key: str) -> dict | None:
+        for order in self._okx_orders:
+            if f"{order.get('inst')}|{order.get('ord_id')}" == key:
+                return order
+        return None
+
+    def _okx_cancel_button(self, key: str) -> QWidget:
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(2, 0, 2, 0)
+        button = QPushButton("İptal")
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setStyleSheet("padding: 1px 8px;")
+        button.clicked.connect(lambda _checked=False, key=key: self._cancel_okx_order(key))
+        row.addWidget(button)
+        return holder
+
+    def _open_order_chart(self, item) -> None:
+        row = item.row()
+        if row < 0 or row >= len(self._okx_orders):
+            return
+        symbol = str(self._okx_orders[row].get("symbol") or "")
+        if not symbol or symbol == self._symbol:
+            self._set_page("market")
+            return
+        self._flush_held_signal()
+        self._symbol = symbol
+        _save_state(self._symbol, self._interval)
+        self._show_symbol(symbol)
+        self._start_snapshot(force=True)
+        self._set_page("market")
+
+    def _cancel_okx_order(self, key: str) -> None:
+        order = self._okx_order(key)
+        if order is None or self._okx_busy():
+            return
+        side, kind, _size = order_face(order)
+        name = base_of(str(order.get("symbol") or ""))
+        price = _price_text(order.get("px"))
+        answer = QMessageBox.question(
+            self,
+            "Emri iptal et",
+            f"{name} {side} {kind} emri {price} fiyatından iptal edilecek.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._send_okx_action(
+            {
+                "kind": "cancel",
+                "order": dict(order),
+                "position": {"symbol": order.get("symbol"), "inst": order.get("inst")},
+            }
+        )
 
     def _okx_buttons(self, key: str) -> QWidget:
         holder = QWidget()
@@ -9378,9 +9407,6 @@ class MainWindow(QMainWindow):
         self._paint_row_price(price)
         self._paint_15_price(price)
         self._touch_candle(price)
-        candles = self._last_candles
-        rising = price >= candles[-1].open if candles else self._live_up
-        self._sync_volume_price(price, rising)
         self._sync_limit_price()
         self._paint_okx_liq()
 
@@ -9455,7 +9481,6 @@ class MainWindow(QMainWindow):
         candle_set.setLow(low)
         candle_set.setClose(price)
         self.price_view.set_last_price(bar.time_ms, price, price >= bar.open)
-        self._sync_volume_price(price, price >= bar.open)
         if self.price_view.zoomed or self.price_view.price_manual:
             return
         if price < float(self.price_y.min()) or price > float(self.price_y.max()):

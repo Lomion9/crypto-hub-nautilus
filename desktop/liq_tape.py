@@ -23,7 +23,8 @@ from PySide6.QtCore import QObject, QThread, Qt, QTimer, QUrl, Signal
 from PySide6.QtNetwork import QAbstractSocket
 from PySide6.QtWebSockets import QWebSocket
 
-from desktop.market import HOUR_MS, MarketError, fetch_klines, fetch_oi_page
+from desktop.liquidity import LEVERAGE, build_map
+from desktop.market import HOUR_MS, Bar, MarketError, Point, fetch_klines, fetch_oi_page
 
 STREAM = "wss://fstream.binance.com/market/ws/btcusdt@forceOrder"
 LIQ_SYMBOL = "BTCUSDT"
@@ -36,6 +37,9 @@ DECIDE_WAIT_MS = 10 * 60 * 1000
 BUFFER_LIMIT = 50
 ARCHIVE_DAYS = 30
 SHIFT_KEY = "oi_kaydirma"
+SNAPSHOT_WINDOWS = (12, 24)
+SNAPSHOT_MARGIN = 0.004
+SNAPSHOT_LEVERAGE = 100
 
 
 def tape_path() -> Path:
@@ -143,6 +147,16 @@ def _ensure(conn: sqlite3.Connection) -> None:
             taker_alis REAL,
             PRIMARY KEY(sembol, saat_ms)
         );
+        CREATE TABLE IF NOT EXISTS cluster_snapshot(
+            t_ms INTEGER NOT NULL,
+            pencere INTEGER NOT NULL,
+            kaynak TEXT NOT NULL,
+            fiyat REAL NOT NULL,
+            atr REAL,
+            agirlik TEXT NOT NULL,
+            kumeler TEXT NOT NULL,
+            PRIMARY KEY(t_ms, pencere, kaynak)
+        );
         """
     )
     found = conn.execute(
@@ -159,6 +173,90 @@ def _ensure(conn: sqlite3.Connection) -> None:
         FROM force_order
         """
     )
+
+
+def _hour_atr(bars: list[Bar]) -> float | None:
+    if len(bars) < 2:
+        return None
+    ranges: list[float] = []
+    previous = bars[0].close
+    for bar in bars[1:]:
+        ranges.append(max(bar.high - bar.low, abs(bar.high - previous), abs(bar.low - previous)))
+        previous = bar.close
+    sample = ranges[-24:]
+    if not sample:
+        return None
+    width = sum(sample) / len(sample)
+    return width if width > 0 else None
+
+
+def snapshot_body(
+    bars: list[Bar],
+    points: list[Point],
+    as_of: int,
+    price: float | None,
+) -> dict | None:
+    """as_of anındaki küme listesi. Gelecek mum ve açık pozisyon girmez."""
+    book = build_map(
+        LIQ_SYMBOL,
+        bars,
+        points,
+        SNAPSHOT_MARGIN,
+        SNAPSHOT_LEVERAGE,
+        as_of=as_of,
+    )
+    if not book.closes:
+        return None
+    seen = [bar for bar in bars if bar.time_ms <= as_of and bar.close > 0]
+    spot = float(price) if isinstance(price, (int, float)) and float(price) > 0 else book.closes[-1]
+    clusters = [
+        {"fiyat": cluster.price, "boyut": cluster.usd, "yon": side}
+        for side, peaks in (("long", book.long_peaks), ("short", book.short_peaks))
+        for cluster in peaks
+    ]
+    return {
+        "t_ms": int(as_of),
+        "fiyat": spot,
+        "atr": _hour_atr(seen),
+        "agirlik": {str(level): weight for level, weight in LEVERAGE.items()},
+        "kumeler": clusters,
+    }
+
+
+def write_snapshot(conn: sqlite3.Connection, body: dict, kaynak: str) -> None:
+    """Aynı ana ikinci kez yazılmaz. Başka tabloya dokunmaz."""
+    payload = json.dumps(body["kumeler"], separators=(",", ":"))
+    weights = json.dumps(body["agirlik"], separators=(",", ":"), sort_keys=True)
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO cluster_snapshot
+            (t_ms, pencere, kaynak, fiyat, atr, agirlik, kumeler)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (body["t_ms"], window, kaynak, body["fiyat"], body["atr"], weights, payload)
+            for window in SNAPSHOT_WINDOWS
+        ],
+    )
+
+
+def _archived_series(conn: sqlite3.Connection) -> tuple[list[Bar], list[Point]]:
+    bars: list[Bar] = []
+    for stamp, opened, high, low, close, volume, taker in conn.execute(
+        "SELECT saat_ms, o, h, l, c, hacim, taker_alis FROM mum_saat WHERE sembol=? ORDER BY saat_ms",
+        (LIQ_SYMBOL,),
+    ):
+        if min(opened, high, low, close) <= 0:
+            continue
+        bars.append(Bar(int(stamp), opened, high, low, close, 2 * taker - volume, volume))
+    points = [
+        Point(int(stamp), float(value))
+        for stamp, value in conn.execute(
+            "SELECT saat_ms, oi FROM oi_saat WHERE sembol=? AND oi > 0 ORDER BY saat_ms",
+            (LIQ_SYMBOL,),
+        )
+    ]
+    return bars, points
 
 
 def _hour_edges(now_ms: int, opens: list[int]) -> tuple[int, int]:
@@ -205,6 +303,29 @@ def _oi_hours(symbol: str, shift: int, now_ms: int, full: bool) -> list[tuple]:
             break
         start = nxt
     return rows
+
+
+class _SnapshotWorker(QThread):
+    done = Signal(object)
+
+    def __init__(self, as_of: int, price: float | None, kaynak: str) -> None:
+        super().__init__()
+        self._as_of = as_of
+        self._price = price
+        self._kaynak = kaynak
+
+    def run(self) -> None:
+        body = None
+        try:
+            conn = sqlite3.connect(tape_path().as_uri() + "?mode=ro", uri=True)
+            try:
+                bars, points = _archived_series(conn)
+            finally:
+                conn.close()
+            body = snapshot_body(bars, points, self._as_of, self._price)
+        except sqlite3.Error:
+            body = None
+        self.done.emit({"kaynak": self._kaynak, "body": body})
 
 
 class _ArchiveWorker(QThread):
@@ -292,6 +413,9 @@ class LiquidationTape(QObject):
         self._again = QTimer(self)
         self._again.setSingleShot(True)
         self._again.timeout.connect(self._kick_archive)
+        self._snap_worker: _SnapshotWorker | None = None
+        self._snap_on = False
+        self._snap_queue: list[tuple[int, float | None, str]] = []
 
     def start(self) -> None:
         self._want = True
@@ -321,6 +445,14 @@ class LiquidationTape(QObject):
         worker = self._worker
         if self._worker_busy() and worker is not None:
             worker.wait(4000)
+        snap = self._snap_worker
+        if snap is not None:
+            try:
+                running = bool(snap.isRunning())
+            except RuntimeError:
+                running = False
+            if running:
+                snap.wait(4000)
         self._db_ready = False
         with self._lock:
             self._db.close()
@@ -454,7 +586,49 @@ class LiquidationTape(QObject):
 
     def _on_hour(self) -> None:
         self._arm_candle()
+        hour = int(time.time() * 1000) // HOUR_MS * HOUR_MS
+        self.note_signal(hour, None, "saat")
         self._kick_archive()
+
+    def note_signal(self, as_of: int, price: float | None, kaynak: str = "sinyal") -> None:
+        """Küme listesini kuyruğa alır. Sinyal ve emir bu çağrıdan dönmez."""
+        if not self._want or not self._db_ready or kaynak not in ("saat", "sinyal"):
+            return
+        if not isinstance(as_of, int) or as_of <= 0:
+            return
+        spot = float(price) if isinstance(price, (int, float)) and float(price) > 0 else None
+        job = (as_of, spot, kaynak)
+        if self._snap_on:
+            self._snap_queue.append(job)
+            return
+        self._start_snap(job)
+
+    def _start_snap(self, job: tuple[int, float | None, str]) -> None:
+        self._snap_on = True
+        worker = _SnapshotWorker(job[0], job[1], job[2])
+        worker.done.connect(self._on_snap, Qt.ConnectionType.QueuedConnection)
+        worker.finished.connect(lambda finished=worker: self._release_snap(finished))
+        self._snap_worker = worker
+        worker.start()
+
+    def _release_snap(self, worker) -> None:
+        if self._snap_worker is worker:
+            self._snap_worker = None
+            self._snap_on = False
+            if self._snap_queue and self._want and self._db_ready:
+                self._start_snap(self._snap_queue.pop(0))
+        worker.deleteLater()
+
+    def _on_snap(self, payload: object) -> None:
+        if not self._db_ready or not isinstance(payload, dict):
+            return
+        body = payload.get("body")
+        kaynak = payload.get("kaynak")
+        if not isinstance(body, dict) or kaynak not in ("saat", "sinyal"):
+            return
+        with self._lock:
+            write_snapshot(self._db, body, str(kaynak))
+            self._db.commit()
 
     def _kick_archive(self) -> None:
         if not self._want or not self._db_ready:

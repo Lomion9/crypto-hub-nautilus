@@ -88,9 +88,13 @@ def nice_step(price: float) -> float:
 
 
 def _weights(max_leverage: int) -> dict[int, float]:
-    chosen = {level: weight for level, weight in LEVERAGE.items() if level <= max_leverage}
+    return _given_weights(LEVERAGE, max_leverage)
+
+
+def _given_weights(raw: dict[int, float], max_leverage: int) -> dict[int, float]:
+    chosen = {level: weight for level, weight in raw.items() if level <= max_leverage and weight > 0}
     if not chosen:
-        chosen = {min(LEVERAGE): 1}
+        chosen = {min(raw): 1} if raw else {min(LEVERAGE): 1}
     total = sum(chosen.values())
     return {level: weight / total for level, weight in chosen.items()}
 
@@ -254,9 +258,17 @@ def build_map(
     conserved: bool = False,
     sweep: dict[int, tuple[float, float]] | None = None,
     inverse: bool = False,
+    as_of: int | None = None,
+    weights: dict[int, float] | None = None,
 ) -> LiquidityMap:
     """Saat saat açık pozisyonu kovalar. OI artışı yeni pozisyon, düşüş oransal kapanıştır.
-    sweep: saat → (en düşük, en yüksek); grafikte gösterilen borsanın fitili de silmeye katılır."""
+    sweep: saat → (en düşük, en yüksek); grafikte gösterilen borsanın fitili de silmeye katılır.
+    as_of verilirse yalnız o ana kadarki mum ve açık pozisyon girer. weights verilmezse LEVERAGE durur."""
+    if as_of is not None:
+        bars = [bar for bar in bars if bar.time_ms <= as_of]
+        oi_points = [point for point in oi_points if point.time_ms <= as_of]
+        if sweep is not None:
+            sweep = {stamp: reach for stamp, reach in sweep.items() if stamp <= as_of}
     result = LiquidityMap(symbol=symbol.upper(), step=1.0)
     if not bars:
         return result
@@ -264,7 +276,7 @@ def build_map(
     if last_close <= 0:
         return result
     step = nice_step(last_close)
-    weights = _weights(max_leverage)
+    weights = _weights(max_leverage) if weights is None else _given_weights(weights, max_leverage)
     oi_at: dict[int, float] = {}
     for point in oi_points:
         if point.value > 0:

@@ -391,22 +391,23 @@ def open_market(
     }
 
 
-def _open(creds: Creds, symbol: str, side: str, tp: float, price: float, margin: float, leverage: int, mode: str, simulated: bool) -> dict:
+def _open(creds: Creds, symbol: str, side: str, tp: float, price: float, margin: float, leverage: int, mode: str, simulated: bool, limit: float | None = None) -> dict:
+    entry = float(limit) if isinstance(limit, (int, float)) and float(limit) > 0 else price
     if side not in ("up", "down"):
         raise OkxError("Yön yok, emir yok")
-    if tp <= 0 or price <= 0:
+    if tp <= 0 or entry <= 0:
         raise OkxError("Hedef yok, emir yok")
-    if side == "up" and tp <= price:
+    if side == "up" and tp <= entry:
         raise OkxError("Take profit girişin altında, emir yok")
-    if side == "down" and tp >= price:
+    if side == "down" and tp >= entry:
         raise OkxError("Take profit girişin üstünde, emir yok")
     inst = inst_id(symbol)
     info = _public_instrument(inst)
     tick = float(info.get("tickSz") or 0)
     tp_px = _round_step(tp, tick)
-    if side == "up" and tp_px <= price:
+    if side == "up" and tp_px <= entry:
         raise OkxError("Take profit girişin altında, emir yok")
-    if side == "down" and tp_px >= price:
+    if side == "down" and tp_px >= entry:
         raise OkxError("Take profit girişin üstünde, emir yok")
     hedge = _hedge(creds, simulated)
     pos_side = ("long" if side == "up" else "short") if hedge else "net"
@@ -415,22 +416,29 @@ def _open(creds: Creds, symbol: str, side: str, tp: float, price: float, margin:
     except (TypeError, ValueError):
         cap = leverage
     used = _set_leverage(creds, inst, leverage, mode, pos_side, simulated, cap)
-    sz, _size = _order_size(creds, inst, side, margin, used, price, info, mode, simulated, None)
+    limit_px = _round_step(entry, tick) if limit else None
+    sized_at = limit_px if limit_px else entry
+    sz, _size = _order_size(creds, inst, side, margin, used, sized_at, info, mode, simulated, limit_px)
     order_side = "buy" if side == "up" else "sell"
+    text = _text_step(tp_px, tick if tick > 0 else 0.00000001)
+    algo = {
+        "tpTriggerPx": text,
+        "tpOrdPx": "-1",
+        "tpTriggerPxType": "last",
+    }
     body = {
         "instId": inst,
         "tdMode": mode,
         "side": order_side,
         "ordType": "market",
         "sz": sz,
-        "attachAlgoOrds": [
-            {
-                "tpTriggerPx": _text_step(tp_px, tick if tick > 0 else 0.00000001),
-                "tpOrdPx": "-1",
-                "tpTriggerPxType": "last",
-            }
-        ],
+        "attachAlgoOrds": [algo],
     }
+    extra = ""
+    if limit_px is not None:
+        body["ordType"] = "limit"
+        body["px"] = _text_step(limit_px, tick if tick > 0 else 0.00000001)
+        extra = f" · limit {format_price(limit_px)}"
     if pos_side in ("long", "short"):
         body["posSide"] = pos_side
     payload = request(creds, "POST", "/api/v5/trade/order", body, simulated)
@@ -441,6 +449,8 @@ def _open(creds: Creds, symbol: str, side: str, tp: float, price: float, margin:
         except OkxError:
             algo_id = ""
     word = "long" if side == "up" else "short"
+    rows = payload.get("data") or []
+    ord_id = str(rows[0].get("ordId") or "") if rows and isinstance(rows[0], dict) else ""
     return {
         "inst": inst,
         "side": side,
@@ -448,8 +458,9 @@ def _open(creds: Creds, symbol: str, side: str, tp: float, price: float, margin:
         "sz": sz,
         "td_mode": mode,
         "tp": tp_px,
+        "ord_id": ord_id,
         "algo_id": algo_id,
-        "message": f"{word} açıldı · {sz} sözleşme · TP {format_price(tp_px)}",
+        "message": f"{word} açıldı · {sz} sözleşme{extra} · TP {format_price(tp_px)}",
     }
 
 
@@ -594,6 +605,8 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
                 results.append(_row(symbol, label, op, True, "açık emir yok", None))
                 continue
             try:
+                _drop_limits(creds, held, simulated)
+                held = _live_size(creds, held, simulated)
                 _close(creds, held, simulated)
                 results.append(_row(symbol, label, op, True, "kapatıldı", None))
             except OkxError as exc:
@@ -623,9 +636,11 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
                 for key in ("inst", "side", "pos_side", "sz", "td_mode", "tp", "algo_id")
                 if key in updated
             }
+            if isinstance(held.get("limits"), list):
+                position["limits"] = list(held["limits"])
             results.append(_row(symbol, label, op, True, str(updated.get("message") or "TP güncellendi"), position))
             continue
-        if op != "open":
+        if op not in ("open", "scale"):
             continue
         if label in blocked:
             results.append(_row(symbol, label, op, False, "önceki pozisyon kapanmadı", None))
@@ -641,14 +656,68 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
             margin = available_usdt(creds, simulated) * min(pct, 100.0) / 100
             if margin <= 0:
                 raise OkxError("Kullanılabilir bakiye yok")
-            opened = _open(creds, symbol, side, float(raw_tp), spot, margin, leverage, mode, simulated)
+            parts = 3 if op == "scale" else 1
+            opened = _open(creds, symbol, side, float(raw_tp), spot, margin / parts, leverage, mode, simulated)
         except (OkxError, TypeError, ValueError) as exc:
             text = str(exc) if str(exc) else "emir gitmedi"
             results.append(_row(symbol, label, op, False, text, None))
             continue
+        limits: list[str] = []
+        notes: list[str] = [str(opened["message"])]
+        if op == "scale":
+            for raw in action.get("limits") or []:
+                try:
+                    level = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    leg = _open(
+                        creds, symbol, side, float(raw_tp), level, margin / parts, leverage, mode, simulated, level
+                    )
+                except (OkxError, TypeError, ValueError) as exc:
+                    notes.append(str(exc) if str(exc) else "limit gitmedi")
+                    continue
+                if leg.get("ord_id"):
+                    limits.append(str(leg["ord_id"]))
+                notes.append(str(leg["message"]))
         position = {key: opened[key] for key in ("inst", "side", "pos_side", "sz", "td_mode", "tp", "algo_id")}
-        results.append(_row(symbol, label, op, True, str(opened["message"]), position))
+        if limits:
+            position["limits"] = limits
+        results.append(_row(symbol, label, "open", True, " · ".join(notes), position))
     return results
+
+
+def _drop_limits(creds: Creds, held: dict, simulated: bool) -> None:
+    inst = str(held.get("inst") or "")
+    for ord_id in held.get("limits") or []:
+        if not ord_id:
+            continue
+        try:
+            cancel_order(creds, {"inst": inst, "ord_id": str(ord_id)}, simulated)
+        except OkxError:
+            continue
+
+
+def _live_size(creds: Creds, held: dict, simulated: bool) -> dict:
+    """Kapanış, dolmuş limitlerin büyüttüğü güncel sözleşme sayısını kullanır."""
+    try:
+        live = fetch_positions(creds, simulated)
+    except OkxError:
+        return held
+    inst = str(held.get("inst") or "")
+    side = str(held.get("side") or "")
+    pos_side = str(held.get("pos_side") or "")
+    for position in live:
+        if position.get("inst") != inst or position.get("side") != side:
+            continue
+        if pos_side and position.get("pos_side") not in (pos_side, "net"):
+            continue
+        if not position.get("sz"):
+            continue
+        sized = dict(held)
+        sized["sz"] = position["sz"]
+        return sized
+    return held
 
 
 _INSTRUMENTS: dict[str, dict] = {}
@@ -692,6 +761,90 @@ def _pending_all(creds: Creds, kind: str, simulated: bool) -> list[dict]:
         simulated=simulated,
     )
     return [row for row in payload.get("data") or [] if isinstance(row, dict)]
+
+
+_ORD_FACE = {
+    "limit": "Limit",
+    "market": "Piyasa",
+    "post_only": "Post only",
+    "fok": "FOK",
+    "ioc": "IOC",
+    "optimal_limit_ioc": "Limit IOC",
+}
+
+
+def fetch_open_orders(creds: Creds, simulated: bool) -> list[dict]:
+    """Dolmamış SWAP emirleri. Limit ve kısmi dolmuş emirler buradadır."""
+    if not creds.ready():
+        raise OkxError("API anahtarı, secret ve parola gerekli")
+    payload = request(creds, "GET", "/api/v5/trade/orders-pending?instType=SWAP", simulated=simulated)
+    orders: list[dict] = []
+    for row in payload.get("data") or []:
+        if not isinstance(row, dict):
+            continue
+        state = str(row.get("state") or "")
+        if state not in ("live", "partially_filled"):
+            continue
+        inst = str(row.get("instId") or "")
+        reduce_only = row.get("reduceOnly")
+        orders.append(
+            {
+                "inst": inst,
+                "symbol": inst.split("-")[0] + "USDT" if inst else "",
+                "ord_id": str(row.get("ordId") or ""),
+                "side": str(row.get("side") or ""),
+                "pos_side": str(row.get("posSide") or "net"),
+                "ord_type": str(row.get("ordType") or ""),
+                "px": _number(row.get("px")),
+                "sz": str(row.get("sz") or "").strip(),
+                "fill": _number(row.get("accFillSz")) or 0.0,
+                "state": state,
+                "reduce_only": reduce_only is True or str(reduce_only).lower() == "true",
+            }
+        )
+    orders.sort(key=lambda item: (str(item.get("symbol") or ""), str(item.get("ord_id") or "")))
+    return orders
+
+
+def cancel_order(creds: Creds, order: dict, simulated: bool) -> dict:
+    inst = str(order.get("inst") or "")
+    ord_id = str(order.get("ord_id") or "")
+    if not inst or not ord_id:
+        raise OkxError("Emir okunamadı")
+    payload = request(
+        creds,
+        "POST",
+        "/api/v5/trade/cancel-order",
+        {"instId": inst, "ordId": ord_id},
+        simulated,
+    )
+    rows = payload.get("data") or []
+    if rows and isinstance(rows[0], dict):
+        code = str(rows[0].get("sCode") or "0")
+        if code not in ("0", ""):
+            raise OkxError(str(rows[0].get("sMsg") or "Emir iptal edilemedi"))
+    return {"message": "emir iptal edildi"}
+
+
+def order_face(order: dict) -> tuple[str, str, str]:
+    """Yön, emir türü ve miktar metni."""
+    buy = order.get("side") == "buy"
+    pos = str(order.get("pos_side") or "net")
+    closing = bool(order.get("reduce_only")) or (pos == "long" and not buy) or (pos == "short" and buy)
+    if pos == "long":
+        side = "Long kapat" if closing else "Long"
+    elif pos == "short":
+        side = "Short kapat" if closing else "Short"
+    else:
+        side = "Alış" if buy else "Satış"
+        if closing:
+            side += " kapat"
+    kind = _ORD_FACE.get(str(order.get("ord_type") or ""), str(order.get("ord_type") or "Emir"))
+    filled = order.get("fill")
+    size = str(order.get("sz") or "—")
+    if isinstance(filled, (int, float)) and filled > 0:
+        size = f"{filled:g} / {size}"
+    return side, kind, size
 
 
 def fetch_positions(creds: Creds, simulated: bool) -> list[dict]:

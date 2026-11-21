@@ -247,15 +247,19 @@ def _load(coin: str, hour_only: bool = False) -> OiPack:
         counted = _COUNTS.get((coin, "15m")) or (0, 0)
     live, live_up, live_known = _cached_live(coin, used, now)
     _save_samples()
-    if not hour_only and live is not None and series.get("15m"):
+    with _LOCK:
+        parts = dict(_LIVE_PARTS.get(coin) or {})
+    aligned, _held = _consistent_open(coin, used, parts)
+    shown_live = aligned if aligned is not None else live
+    if not hour_only and shown_live is not None and series.get("15m"):
         bar = BAR_MS["15m"]
         stamp = now // bar * bar
         closed = [point for point in series["15m"] if point.time_ms < stamp]
-        closed.append(Point(stamp, live))
+        closed.append(Point(stamp, shown_live))
         series["15m"] = closed
-    shown_up = live_up if live is not None else counted[0]
-    shown_known = live_known if live is not None else counted[1]
-    return OiPack(series, live, shown_up, shown_known)
+    shown_up = live_up if shown_live is not None else counted[0]
+    shown_known = live_known if shown_live is not None else counted[1]
+    return OiPack(series, shown_live, shown_up, shown_known)
 
 
 def _cached_live(coin: str, names: list[str], now: int) -> tuple[float | None, int, int]:
@@ -378,6 +382,46 @@ def _latest_kept(name: str, coin: str) -> float | None:
     if not points:
         return None
     return points[-1].value
+
+
+def _kept_tail(name: str, coin: str) -> list[Point]:
+    with _LOCK:
+        return list(_KEPT.get((name, f"{coin}:15m")) or [])
+
+
+def _consistent_open(coin: str, names: list[str], parts: dict[str, float]) -> tuple[float | None, list[str]]:
+    """Açık mum, geçmişle aynı ölçekteki canlı değerden kurulur.
+
+    Canlı okuma son basılı mumdan belirgin şekilde kopuksa o borsa son
+    basılı değerde kalır. Böylece farklı uç noktası her 15 dakikada sahte
+    bir sıçrama yazmaz.
+    """
+    total = 0.0
+    counted = 0
+    held: list[str] = []
+    for name in names:
+        tail = _kept_tail(name, coin)
+        last = tail[-1].value if tail else None
+        prev = tail[-2].value if len(tail) >= 2 else None
+        live = parts.get(name)
+        chosen = last
+        if live is not None and live > 0:
+            if last is None or last <= 0:
+                chosen = live
+            else:
+                gap = abs(live - last) / last
+                recent = abs(last - prev) / prev if prev and prev > 0 else 0.0
+                if gap <= max(0.08, recent * 4):
+                    chosen = live
+                else:
+                    held.append(name)
+        if chosen is None or chosen <= 0:
+            continue
+        total += chosen
+        counted += 1
+    if counted == 0:
+        return None, held
+    return total, held
 
 
 def _note_live_only(coin: str) -> None:
