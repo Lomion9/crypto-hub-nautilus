@@ -292,33 +292,30 @@ def plan_risk(
     stop: float,
     cap: int,
     tier_cap: int = 0,
-    mmr: float = 0.004,
+    user_cap: int = 0,
 ) -> tuple[int, float, float] | None:
-    """Kaldıraç, marjin ve pozisyon büyüklüğü. Kaldıraç aşağı tam sayıdır."""
+    """Kasa teminattır. Kaldıraç, stopta kayıp risk yüzdesini geçmeyecek en yüksek tam sayıdır."""
     if equity <= 0 or entry <= 0 or stop <= 0 or risk_pct <= 0:
         return None
     distance = abs(entry - stop) / entry
     if distance <= 0 or distance >= 1:
         return None
-    risk = equity * risk_pct / 100.0
-    notional = risk / distance
-    cushion = distance + (mmr if mmr > 0 else 0.004)
-    if cushion <= 0:
-        return None
-    lever = int(math.floor(1.0 / cushion))
-    ceiling = cap if cap > 0 else lever
+    goal = int(math.floor((risk_pct / 100.0) / distance))
+    ceiling = cap if cap > 0 else max(goal, 1)
     if tier_cap > 0:
         ceiling = min(ceiling, tier_cap)
+    if user_cap > 0:
+        ceiling = min(ceiling, user_cap)
     if ceiling < 1:
         return None
-    lever = max(1, min(lever, ceiling))
-    margin = notional / lever
-    if margin > equity:
-        margin = equity
-        notional = equity * lever
-    if margin <= 0 or notional <= 0:
-        return None
-    return lever, margin, notional
+    if goal < 1:
+        notional = equity * (risk_pct / 100.0) / distance
+        margin = min(equity, notional)
+        if margin <= 0:
+            return None
+        return 1, margin, margin
+    lever = min(goal, ceiling)
+    return lever, equity, equity * lever
 
 
 def _tier_cap(inst: str, contracts: float, mode: str) -> tuple[int, float]:
@@ -370,8 +367,9 @@ def size_for_risk(
     entry: float,
     stop: float,
     mode: str,
+    user_cap: int = 0,
 ) -> tuple[int, float]:
-    """Otomatik emrin kaldıracı ve marjini. Borsa tavanının üstüne çıkmaz."""
+    """Otomatik emrin kaldıracı ve marjini. Kasa teminattır; tavanın üstüne çıkmaz."""
     info = _public_instrument(inst_id(symbol))
     try:
         cap = int(float(info.get("lever") or 0))
@@ -379,21 +377,30 @@ def size_for_risk(
         cap = 0
     if cap < 1:
         raise OkxError("Kaldıraç sınırı alınamadı")
-    preview = plan_risk(equity, risk_pct, entry, stop, cap)
-    if preview is None:
+    goal = plan_risk(equity, risk_pct, entry, stop, cap, 0, user_cap)
+    if goal is None:
         raise OkxError("Stop mesafesi yok, emir yok")
-    _lever, _margin, notional = preview
+    lever, margin, notional = goal
     ct_val = float(info.get("ctVal") or 0)
     unit = ct_val if str(info.get("ctValCcy") or "").upper() == "USDT" else ct_val * entry
-    contracts = notional / unit if unit > 0 else 0.0
-    tier_cap, mmr = _tier_cap(inst_id(symbol), contracts, mode)
-    chosen = plan_risk(equity, risk_pct, entry, stop, cap, tier_cap, mmr)
-    if chosen is None:
-        raise OkxError("Stop mesafesi yok, emir yok")
-    lever, margin, _notional = chosen
-    if margin <= 0 or lever < 1:
-        raise OkxError("Kullanılabilir bakiye yok")
-    return lever, margin
+    if unit <= 0 or margin + 1e-9 < equity:
+        if unit > 0:
+            tier_cap, _mmr = _tier_cap(inst_id(symbol), notional / unit, mode)
+            if tier_cap > 0 and lever > tier_cap:
+                raise OkxError("OKX bu boyda kaldıraca izin vermiyor")
+        return lever, margin
+    lo = 1
+    hi = lever
+    best = 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        tier_cap, _mmr = _tier_cap(inst_id(symbol), (equity * mid) / unit, mode)
+        if tier_cap <= 0 or mid <= tier_cap:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best, equity
 
 
 def _set_leverage(creds: Creds, inst: str, lever: int, mode: str, pos_side: str, simulated: bool, cap: int) -> int:
@@ -450,8 +457,10 @@ def open_market(
     mode: str,
     simulated: bool,
     limit: float | None = None,
+    tp: float | None = None,
+    sl: float | None = None,
 ) -> dict:
-    """Piyasa veya limit emri. Take profit eklenmez; boy marjin ve kaldıraçla hesaplanır."""
+    """Piyasa veya limit emri. Dolu TP ve SL emirle birlikte yazılır."""
     if side not in ("up", "down"):
         raise OkxError("Yön yok, emir yok")
     if price <= 0:
@@ -489,6 +498,26 @@ def open_market(
         extra = f" · limit {format_price(px)}"
     if pos_side in ("long", "short"):
         body["posSide"] = pos_side
+    ref = limit_px if limit_px else price
+    algo: dict[str, str] = {}
+    if isinstance(tp, (int, float)) and float(tp) > 0:
+        tp_px, tp_text = _tick_text(float(tp), info)
+        if (side == "up" and tp_px <= ref) or (side == "down" and tp_px >= ref):
+            raise OkxError("TP fiyatın yanlış tarafında")
+        algo["tpTriggerPx"] = tp_text
+        algo["tpOrdPx"] = "-1"
+        algo["tpTriggerPxType"] = "last"
+        extra += f" · TP {format_price(tp_px)}"
+    if isinstance(sl, (int, float)) and float(sl) > 0:
+        sl_px, sl_text = _tick_text(float(sl), info)
+        if (side == "up" and sl_px >= ref) or (side == "down" and sl_px <= ref):
+            raise OkxError("SL fiyatın yanlış tarafında")
+        algo["slTriggerPx"] = sl_text
+        algo["slOrdPx"] = "-1"
+        algo["slTriggerPxType"] = "last"
+        extra += f" · SL {format_price(sl_px)}"
+    if algo:
+        body["attachAlgoOrds"] = [algo]
     request(creds, "POST", "/api/v5/trade/order", body, simulated)
     word = "long" if side == "up" else "short"
     return {
@@ -790,7 +819,13 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
                 raise OkxError("Stop girişin üstünde, emir yok")
             if side == "down" and float(raw_sl) <= spot:
                 raise OkxError("Stop girişin altında, emir yok")
-            leverage, margin = size_for_risk(symbol, equity, risk_pct, spot, float(raw_sl), mode)
+            try:
+                user_cap = int(settings.get("lever_cap") or 0)
+            except (TypeError, ValueError):
+                user_cap = 0
+            leverage, margin = size_for_risk(
+                symbol, equity, risk_pct, spot, float(raw_sl), mode, max(0, user_cap)
+            )
             parts = 3 if op == "scale" else 1
             opened = _open(
                 creds, symbol, side, float(raw_tp), spot, margin / parts, leverage, mode, simulated, sl=float(raw_sl)
@@ -949,8 +984,18 @@ def fetch_open_orders(creds: Creds, simulated: bool) -> list[dict]:
                 "fill": _number(row.get("accFillSz")) or 0.0,
                 "state": state,
                 "reduce_only": reduce_only is True or str(reduce_only).lower() == "true",
+                "tp": None,
+                "sl": None,
+                "attach_algo_id": "",
             }
         )
+        attached = row.get("attachAlgoOrds") or []
+        first = attached[0] if attached and isinstance(attached[0], dict) else {}
+        if not first and isinstance(row.get("linkedAlgoOrd"), dict):
+            first = row["linkedAlgoOrd"]
+        orders[-1]["tp"] = _number(first.get("tpTriggerPx"))
+        orders[-1]["sl"] = _number(first.get("slTriggerPx"))
+        orders[-1]["attach_algo_id"] = str(first.get("attachAlgoId") or "")
     orders.sort(key=lambda item: (str(item.get("symbol") or ""), str(item.get("ord_id") or "")))
     return orders
 
@@ -1128,6 +1173,153 @@ def set_tp_sl(creds: Creds, position: dict, tp: float | None, sl: float | None, 
         parts.append(f"SL {format_price(sl)}")
     payload = request(creds, "POST", "/api/v5/trade/order-algo", body, simulated)
     return {"algo_id": _algo_id(payload), "tp": tp, "sl": sl, "message": " · ".join(parts)}
+
+
+def _order_trade_side(order: dict) -> str | None:
+    """Limit emrin açacağı yön. Long yukarı, short aşağı."""
+    buy = order.get("side") == "buy"
+    pos = str(order.get("pos_side") or "net")
+    closing = bool(order.get("reduce_only")) or (pos == "long" and not buy) or (pos == "short" and buy)
+    if pos == "long":
+        return "down" if closing else "up"
+    if pos == "short":
+        return "up" if closing else "down"
+    if closing:
+        return "down" if buy else "up"
+    return "up" if buy else "down"
+
+
+def _fresh_order(creds: Creds, inst: str, ord_id: str, simulated: bool) -> dict:
+    payload = request(creds, "GET", f"/api/v5/trade/order?instId={inst}&ordId={ord_id}", simulated=simulated)
+    rows = payload.get("data") or []
+    if not rows or not isinstance(rows[0], dict):
+        raise OkxError("Emir bulunamadı")
+    return rows[0]
+
+
+def _checked(payload: dict, fallback: str) -> None:
+    rows = payload.get("data") or []
+    if rows and isinstance(rows[0], dict):
+        code = str(rows[0].get("sCode") or "0")
+        if code not in ("0", ""):
+            raise OkxError(str(rows[0].get("sMsg") or fallback))
+
+
+def _attach_refused(message: str) -> bool:
+    text = message.lower()
+    return "attachalgoords is not supported" in text or "must enter a price" in text
+
+
+def set_order_tp_sl(creds: Creds, order: dict, tp: float | None, sl: float | None, simulated: bool) -> dict:
+    """Bekleyen limit emre take profit ve stop loss yazar. Boş taraf kaldırılır."""
+    inst = str(order.get("inst") or "")
+    ord_id = str(order.get("ord_id") or "")
+    side = _order_trade_side(order)
+    if not inst or not ord_id or side not in ("up", "down"):
+        raise OkxError("Emir okunamadı")
+    row = _fresh_order(creds, inst, ord_id, simulated)
+    if str(row.get("state") or "") not in ("live", "partially_filled"):
+        raise OkxError("Emir artık beklemiyor")
+    limit = _number(row.get("px")) or _number(order.get("px")) or 0.0
+    if limit <= 0:
+        raise OkxError("Limit fiyatı yok")
+    tp = tp if tp and tp > 0 else None
+    sl = sl if sl and sl > 0 else None
+    attached = row.get("attachAlgoOrds") or []
+    first = attached[0] if attached and isinstance(attached[0], dict) else {}
+    attach_id = str(first.get("attachAlgoId") or order.get("attach_algo_id") or "")
+    if tp is None and sl is None and not attach_id:
+        return {"tp": None, "sl": None, "message": "TP/SL yok"}
+    info = _instrument(inst)
+    algo: dict[str, str] = {}
+    placed: dict[str, str] = {}
+    parts: list[str] = []
+    if attach_id:
+        algo["attachAlgoId"] = attach_id
+    if tp is not None:
+        tp, text = _tick_text(tp, info)
+        if (side == "up" and tp <= limit) or (side == "down" and tp >= limit):
+            raise OkxError("TP fiyatın yanlış tarafında")
+        algo["newTpTriggerPx"] = text
+        algo["newTpOrdPx"] = "-1"
+        algo["newTpTriggerPxType"] = "last"
+        placed["tpTriggerPx"] = text
+        placed["tpOrdPx"] = "-1"
+        placed["tpTriggerPxType"] = "last"
+        parts.append(f"TP {format_price(tp)}")
+    elif attach_id:
+        algo["newTpTriggerPx"] = "0"
+    if sl is not None:
+        sl, text = _tick_text(sl, info)
+        if (side == "up" and sl >= limit) or (side == "down" and sl <= limit):
+            raise OkxError("SL fiyatın yanlış tarafında")
+        algo["newSlTriggerPx"] = text
+        algo["newSlOrdPx"] = "-1"
+        algo["newSlTriggerPxType"] = "last"
+        placed["slTriggerPx"] = text
+        placed["slOrdPx"] = "-1"
+        placed["slTriggerPxType"] = "last"
+        parts.append(f"SL {format_price(sl)}")
+    elif attach_id:
+        algo["newSlTriggerPx"] = "0"
+    try:
+        payload = request(
+            creds,
+            "POST",
+            "/api/v5/trade/amend-order",
+            {"instId": inst, "ordId": ord_id, "attachAlgoOrds": [algo]},
+            simulated,
+        )
+        _checked(payload, "TP/SL yazılamadı")
+    except OkxError as exc:
+        if attach_id or not placed or not _attach_refused(str(exc)):
+            raise
+        _replace_limit(creds, row, placed, simulated)
+        parts.append("emir yenilendi")
+    return {"tp": tp, "sl": sl, "message": " · ".join(parts) if parts else "TP/SL kaldırıldı"}
+
+
+def _replace_limit(creds: Creds, row: dict, attached: dict[str, str], simulated: bool) -> None:
+    """TP'siz açılmış limit emri aynı fiyat ve kalan miktarla, TP/SL ekleyerek yeniden yazar."""
+    inst = str(row.get("instId") or "")
+    ord_id = str(row.get("ordId") or "")
+    kind = str(row.get("ordType") or "")
+    if kind not in ("limit", "post_only"):
+        raise OkxError("TP/SL yalnız bekleyen limit emre yazılır")
+    fill = _number(row.get("accFillSz")) or 0.0
+    if fill <= 0:
+        size = str(row.get("sz") or "").strip()
+    else:
+        left = (_number(row.get("sz")) or 0.0) - fill
+        info = _instrument(inst)
+        lot = float(info.get("lotSz") or 1)
+        left = _floor_step(left, lot)
+        if left <= 0:
+            raise OkxError("Emrin kalan miktarı yok")
+        size = _text_step(left, lot)
+    if not size:
+        raise OkxError("Emir miktarı yok")
+    cancel = request(creds, "POST", "/api/v5/trade/cancel-order", {"instId": inst, "ordId": ord_id}, simulated)
+    _checked(cancel, "Eski emir iptal edilemedi")
+    body = {
+        "instId": inst,
+        "tdMode": str(row.get("tdMode") or "cross"),
+        "side": str(row.get("side") or ""),
+        "ordType": kind,
+        "px": str(row.get("px") or ""),
+        "sz": size,
+        "attachAlgoOrds": [attached],
+    }
+    pos_side = str(row.get("posSide") or "net")
+    if pos_side in ("long", "short"):
+        body["posSide"] = pos_side
+    if str(row.get("reduceOnly") or "").lower() == "true":
+        body["reduceOnly"] = True
+    try:
+        placed = request(creds, "POST", "/api/v5/trade/order", body, simulated)
+        _checked(placed, "TP'li emir yazılamadı")
+    except OkxError as exc:
+        raise OkxError(f"Eski emir iptal edildi, TP'li emir yazılamadı: {exc}") from exc
 
 
 def set_trailing(

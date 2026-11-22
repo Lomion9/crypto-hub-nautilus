@@ -1,4 +1,4 @@
-"""Riskten pozisyon büyüklüğü ve kaldıraç. Ağ yok."""
+"""Kasanın tümü teminat. Stopta kayıp risk yüzdesini geçmez. Ağ yok."""
 
 from desktop.okx_trade import plan_risk
 
@@ -11,23 +11,23 @@ def main() -> None:
     sized = plan_risk(equity, risk, entry, stop, 100)
     assert sized is not None
     lever, margin, notional = sized
-    stake = equity * risk / 100
-    assert abs(notional / stake - (1 / 0.03)) < 0.01
-    assert isinstance(lever, int)
-    assert 1 <= lever <= 100
-    assert lever == int((1 / (0.03 + 0.004)) // 1)
-    assert abs(margin * lever - notional) < 1e-6
-    capped = plan_risk(equity, risk, entry, stop, 100, tier_cap=20)
-    assert capped is not None and capped[0] == 20
-    limited = plan_risk(equity, risk, entry, stop, 10)
-    assert limited is not None and limited[0] == 10
-    tight = plan_risk(100.0, 8.0, 60_000.0, 59_970.0, 50)
-    assert tight is not None
-    assert tight[0] <= 50
-    assert tight[1] <= 100.0
+    assert lever == 2
+    assert margin == equity
+    assert notional == equity * lever
+    assert notional * 0.03 <= equity * risk / 100 + 1e-6
+    tight = plan_risk(equity, risk, entry, 59_940.0, 100)
+    assert tight is not None and tight[0] == 80 and tight[1] == equity
+    limited = plan_risk(equity, risk, entry, 59_940.0, 100, user_cap=8)
+    assert limited is not None and limited[0] == 8 and limited[1] == equity
+    assert limited[2] * (60.0 / entry) <= equity * risk / 100 + 1e-6
+    capped = plan_risk(equity, risk, entry, 59_940.0, 10)
+    assert capped is not None and capped[0] == 10
+    wide = plan_risk(equity, risk, entry, 48_000.0, 100)
+    assert wide is not None and wide[0] == 1 and wide[1] < equity
+    assert abs(wide[2] * 0.20 - equity * risk / 100) < 1e-6
     assert plan_risk(equity, risk, entry, entry, 100) is None
     print("risk hesabı geçti")
-    print("kaldıraç", lever, "büyüklük", round(notional, 2), "marjin", round(margin, 2))
+    print("kaldıraç", lever, "marjin", round(margin, 2), "büyüklük", round(notional, 2))
 
 
 if __name__ == "__main__":

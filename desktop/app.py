@@ -108,6 +108,7 @@ from desktop.okx_trade import (
     order_face,
     open_market as okx_open_market,
     ping as okx_ping,
+    set_order_tp_sl as okx_set_order_tp_sl,
     set_tp_sl as okx_set_tp_sl,
     set_trailing as okx_set_trailing,
 )
@@ -1234,11 +1235,7 @@ def _okx_block(data: dict) -> str:
     )
     if not creds.ready():
         return "API bilgisi eksik"
-    try:
-        leverage = int(data.get("okx_leverage") or 0)
-    except (TypeError, ValueError):
-        leverage = 0
-    if leverage < 1:
+    if _auto_leverage(data) < 1:
         return "kaldıraç seçilmedi"
     if not _chosen_windows(data):
         return "emir gidecek aralık seçilmedi"
@@ -1298,6 +1295,18 @@ def _margin_pct(data: dict) -> int:
     return min(100, max(1, pct))
 
 
+def _auto_leverage(data: dict) -> int:
+    """Otomatik emrin çıkabileceği en yüksek kaldıraç."""
+    raw = data.get("okx_auto_leverage")
+    if raw is None:
+        raw = data.get("okx_leverage")
+    try:
+        lever = int(raw or 0)
+    except (TypeError, ValueError):
+        return 5
+    return min(999, max(1, lever))
+
+
 def _risk_pct(data: dict) -> float:
     """Otomatik işlemde göze alınan kasa yüzdesi. Kayıt yoksa %8."""
     try:
@@ -1313,7 +1322,7 @@ POSITION_COLUMNS = (
     "Coin", "Yön", "Boyut", "Giriş", "Breakeven", "Mark", "PnL", "Likidasyon",
     "Marjin", "Kaldıraç", "TP", "SL", "Trailing", "Kaynak", "İşlem",
 )
-ORDER_COLUMNS = ("Coin", "Yön", "Tür", "Fiyat", "Miktar", "Durum", "İşlem")
+ORDER_COLUMNS = ("Coin", "Yön", "Tür", "Fiyat", "Miktar", "Durum", "TP", "SL", "İşlem")
 LIQ_NEAR = QColor("#ff9800")
 
 
@@ -3756,9 +3765,13 @@ class _OkxAction(QThread):
                     str(job.get("mgn_mode") or "cross"),
                     self._simulated,
                     limit,
+                    job.get("tp"),
+                    job.get("sl"),
                 )
             elif job.get("kind") == "cancel":
                 result = okx_cancel_order(self._creds, job["order"], self._simulated)
+            elif job.get("kind") == "order_tpsl":
+                result = okx_set_order_tp_sl(self._creds, job["order"], job.get("tp"), job.get("sl"), self._simulated)
             elif job.get("kind") == "tpsl":
                 result = okx_set_tp_sl(self._creds, job["position"], job.get("tp"), job.get("sl"), self._simulated)
             else:
@@ -5493,7 +5506,7 @@ class _TargetTable:
         return best
 
     def nearest_stop(self, side: str, price: float | None) -> float | None:
-        """İşlemin kendi tarafındaki en yakın küme. Long altta, short üstte."""
+        """Kendi taraftaki en büyük küme. Long altta, short üstte."""
         shown = self.shown
         if self.window is None or side not in ("up", "down"):
             return None
@@ -5501,11 +5514,12 @@ class _TargetTable:
         if spot <= 0:
             return None
         best: float | None = None
-        for level, _usd in self._entries():
-            if side == "up" and level < spot and (best is None or level > best):
-                best = level
-            elif side == "down" and level > spot and (best is None or level < best):
-                best = level
+        best_usd = 0.0
+        for level, usd in self._entries():
+            if side == "up" and level < spot and (best is None or usd > best_usd):
+                best, best_usd = level, usd
+            elif side == "down" and level > spot and (best is None or usd > best_usd):
+                best, best_usd = level, usd
         if best is None or best == spot:
             return None
         return best
@@ -6829,34 +6843,55 @@ class MainWindow(QMainWindow):
         column = QVBoxLayout(form)
         column.setContentsMargins(10, 10, 10, 10)
         column.setSpacing(8)
-        self._okx_enabled = QCheckBox("Otomatik işlem")
-        self._okx_enabled.setChecked(bool(data.get("okx_enabled")))
-        self._okx_simulated = QCheckBox("Simülasyon (demo API anahtarı)")
-        self._okx_simulated.setChecked(bool(data.get("okx_simulated")))
-        self._okx_enabled.toggled.connect(lambda _on: self._save_okx_form())
-        self._okx_simulated.toggled.connect(lambda _on: self._save_okx_form())
-        column.addWidget(self._okx_enabled)
-        column.addWidget(self._okx_simulated)
-        spins = QHBoxLayout()
-        lever_box = QVBoxLayout()
-        lever_box.addWidget(QLabel("Kaldıraç"))
-        self._okx_lever = QSpinBox()
-        self._okx_lever.setRange(1, 999)
-        self._okx_lever.setKeyboardTracking(False)
-        try:
-            lever = int(data.get("okx_leverage") or 5)
-        except (TypeError, ValueError):
-            lever = 5
-        self._okx_lever.setValue(min(999, max(1, lever)))
-        self._okx_lever_ok = int(self._okx_lever.value())
+        self._okx_form_ready = False
         self._okx_cap = None
         self._okx_cap_symbol = ""
         self._lever_hold = False
-        self._okx_lever.setFixedWidth(52)
-        self._okx_lever.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._okx_lever.valueChanged.connect(self._on_lever_changed)
-        lever_box.addWidget(self._okx_lever)
-        spins.addLayout(lever_box)
+        switch = QHBoxLayout()
+        switch.setSpacing(6)
+        self._okx_auto_page = QPushButton("Otomatik")
+        self._okx_manual_page = QPushButton("Manuel")
+        for button in (self._okx_auto_page, self._okx_manual_page):
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setMinimumWidth(96)
+            button.setStyleSheet(
+                "QPushButton { background: transparent; color: #e4e4e7; border: 1px solid #3f3f46;"
+                " border-radius: 4px; padding: 6px 12px; }"
+                "QPushButton:hover { color: #fafafa; }"
+                "QPushButton:pressed, QPushButton:checked, QPushButton:checked:hover, QPushButton:checked:pressed"
+                " { background: #fafafa; color: #09090b; border-color: #fafafa; }"
+            )
+        page_group = QButtonGroup(form)
+        page_group.setExclusive(True)
+        page_group.addButton(self._okx_auto_page)
+        page_group.addButton(self._okx_manual_page)
+        switch.addWidget(self._okx_auto_page)
+        switch.addWidget(self._okx_manual_page)
+        switch.addStretch(1)
+        column.addLayout(switch)
+        self._okx_simulated = QCheckBox("Simülasyon (demo API anahtarı)")
+        self._okx_simulated.setChecked(bool(data.get("okx_simulated")))
+        self._okx_simulated.toggled.connect(lambda _on: self._save_okx_form())
+        column.addWidget(self._okx_simulated)
+        self._okx_mode = _QuietCombo()
+        self._okx_mode.addItem("Çapraz", "cross")
+        self._okx_mode.addItem("İzole", "isolated")
+        saved_mode = str(data.get("okx_mgn_mode") or "cross")
+        self._okx_mode.setCurrentIndex(1 if saved_mode == "isolated" else 0)
+        self._okx_mode.currentIndexChanged.connect(lambda _index: self._save_okx_form())
+        column.addWidget(QLabel("Marjin modu"))
+        column.addWidget(self._okx_mode)
+        self._okx_stack = QStackedWidget()
+        auto = QWidget()
+        auto_column = QVBoxLayout(auto)
+        auto_column.setContentsMargins(0, 0, 0, 0)
+        auto_column.setSpacing(8)
+        self._okx_enabled = QCheckBox("Otomatik işlem")
+        self._okx_enabled.setChecked(bool(data.get("okx_enabled")))
+        self._okx_enabled.toggled.connect(lambda _on: self._save_okx_form())
+        auto_column.addWidget(self._okx_enabled)
+        auto_spins = QHBoxLayout()
         risk_box = QVBoxLayout()
         risk_box.addWidget(QLabel("İşlem riski %"))
         self._okx_risk = QDoubleSpinBox()
@@ -6868,63 +6903,22 @@ class MainWindow(QMainWindow):
         self._okx_risk.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._okx_risk.valueChanged.connect(lambda _value: self._save_okx_form())
         risk_box.addWidget(self._okx_risk)
-        spins.addLayout(risk_box)
-        spins.addStretch(1)
-        column.addLayout(spins)
-        column.addWidget(QLabel("Marjin (kullanılabilir bakiyenin yüzdesi)"))
-        margin_row = QHBoxLayout()
-        self._okx_margin = QSlider(Qt.Orientation.Horizontal)
-        self._okx_margin.setRange(1, 100)
-        self._okx_margin.setSingleStep(1)
-        self._okx_margin.setPageStep(10)
-        self._okx_margin.setValue(_margin_pct(data))
-        self._okx_margin.valueChanged.connect(lambda _value: self._paint_okx_size())
-        self._okx_margin.valueChanged.connect(lambda _value: self._paint_okx_liq(True))
-        self._okx_margin.sliderReleased.connect(self._save_okx_form)
-        self._okx_margin.valueChanged.connect(
-            lambda _value: None if self._okx_margin.isSliderDown() else self._save_okx_form()
-        )
-        self._okx_margin_value = QLabel("")
-        self._okx_margin_value.setMinimumWidth(190)
-        self._okx_margin_value.setStyleSheet("color: #e4e4e7; font-family: Consolas, monospace;")
-        margin_row.addWidget(self._okx_margin, 1)
-        margin_row.addWidget(self._okx_margin_value)
-        column.addLayout(margin_row)
-        self._okx_size = QLabel("")
-        self._okx_size.setStyleSheet("color: #a1a1aa; font-size: 11px;")
-        column.addWidget(self._okx_size)
-        self._okx_mode = _QuietCombo()
-        self._okx_mode.addItem("Çapraz", "cross")
-        self._okx_mode.addItem("İzole", "isolated")
-        saved_mode = str(data.get("okx_mgn_mode") or "cross")
-        self._okx_mode.setCurrentIndex(1 if saved_mode == "isolated" else 0)
-        self._okx_mode.currentIndexChanged.connect(lambda _index: self._save_okx_form())
-        column.addWidget(QLabel("Marjin modu"))
-        column.addWidget(self._okx_mode)
-        trade_row = QHBoxLayout()
-        self._okx_ord = _QuietCombo()
-        self._okx_ord.addItem("Piyasa", "market")
-        self._okx_ord.addItem("Limit", "limit")
-        self._okx_ord.currentIndexChanged.connect(self._on_order_kind)
-        self._limit_edited = False
-        buy = QPushButton("Al")
-        sell = QPushButton("Sat")
-        buy.clicked.connect(lambda: self._manual_order("up"))
-        sell.clicked.connect(lambda: self._manual_order("down"))
-        trade_row.addWidget(self._okx_ord)
-        trade_row.addWidget(buy)
-        trade_row.addWidget(sell)
-        trade_row.addStretch(1)
-        column.addLayout(trade_row)
-        self._okx_limit = QLineEdit()
-        self._okx_limit.setPlaceholderText("Limit fiyat")
-        self._okx_limit.setVisible(False)
-        self._okx_limit.textEdited.connect(self._mark_limit_edited)
-        column.addWidget(self._okx_limit)
-        self._okx_liq = QLabel("Likidasyon · bakiye bekleniyor")
-        self._okx_liq.setWordWrap(True)
-        self._okx_liq.setStyleSheet("color: #a1a1aa; font-size: 11px;")
-        column.addWidget(self._okx_liq)
+        auto_spins.addLayout(risk_box)
+        auto_lever_box = QVBoxLayout()
+        auto_lever_box.addWidget(QLabel("Maksimum kaldıraç"))
+        self._okx_auto_lever = QSpinBox()
+        self._okx_auto_lever.setRange(1, 999)
+        self._okx_auto_lever.setKeyboardTracking(False)
+        self._okx_auto_lever.setValue(_auto_leverage(data))
+        self._okx_auto_lever_ok = int(self._okx_auto_lever.value())
+        self._okx_auto_lever.setFixedWidth(52)
+        self._okx_auto_lever.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._okx_auto_lever.setToolTip("Stop yakınsa otomatik emir bu kaldıracın üstüne çıkmaz")
+        self._okx_auto_lever.valueChanged.connect(self._on_auto_lever_changed)
+        auto_lever_box.addWidget(self._okx_auto_lever)
+        auto_spins.addLayout(auto_lever_box)
+        auto_spins.addStretch(1)
+        auto_column.addLayout(auto_spins)
         picks = QHBoxLayout()
         picks.setSpacing(12)
         self._okx_window_button, self._okx_window_actions = self._okx_choice_menu(
@@ -6943,7 +6937,92 @@ class MainWindow(QMainWindow):
             box.addWidget(button)
             picks.addLayout(box)
         picks.addStretch(1)
-        column.addLayout(picks)
+        auto_column.addLayout(picks)
+        auto_column.addStretch(1)
+        manual = QWidget()
+        manual_column = QVBoxLayout(manual)
+        manual_column.setContentsMargins(0, 0, 0, 0)
+        manual_column.setSpacing(8)
+        lever_box = QVBoxLayout()
+        lever_box.addWidget(QLabel("Kaldıraç"))
+        self._okx_lever = QSpinBox()
+        self._okx_lever.setRange(1, 999)
+        self._okx_lever.setKeyboardTracking(False)
+        try:
+            lever = int(data.get("okx_leverage") or 5)
+        except (TypeError, ValueError):
+            lever = 5
+        self._okx_lever.setValue(min(999, max(1, lever)))
+        self._okx_lever_ok = int(self._okx_lever.value())
+        self._okx_lever.setFixedWidth(52)
+        self._okx_lever.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._okx_lever.valueChanged.connect(self._on_lever_changed)
+        lever_box.addWidget(self._okx_lever)
+        manual_column.addLayout(lever_box)
+        manual_column.addWidget(QLabel("Marjin (kullanılabilir bakiyenin yüzdesi)"))
+        margin_row = QHBoxLayout()
+        self._okx_margin = QSlider(Qt.Orientation.Horizontal)
+        self._okx_margin.setRange(1, 100)
+        self._okx_margin.setSingleStep(1)
+        self._okx_margin.setPageStep(10)
+        self._okx_margin.setValue(_margin_pct(data))
+        self._okx_margin.valueChanged.connect(lambda _value: self._paint_okx_size())
+        self._okx_margin.valueChanged.connect(lambda _value: self._paint_okx_liq(True))
+        self._okx_margin.sliderReleased.connect(self._save_okx_form)
+        self._okx_margin.valueChanged.connect(
+            lambda _value: None if self._okx_margin.isSliderDown() else self._save_okx_form()
+        )
+        self._okx_margin_value = QLabel("")
+        self._okx_margin_value.setMinimumWidth(190)
+        self._okx_margin_value.setStyleSheet("color: #e4e4e7; font-family: Consolas, monospace;")
+        margin_row.addWidget(self._okx_margin, 1)
+        margin_row.addWidget(self._okx_margin_value)
+        manual_column.addLayout(margin_row)
+        self._okx_size = QLabel("")
+        self._okx_size.setStyleSheet("color: #a1a1aa; font-size: 11px;")
+        manual_column.addWidget(self._okx_size)
+        trade_row = QHBoxLayout()
+        self._okx_ord = _QuietCombo()
+        self._okx_ord.addItem("Piyasa", "market")
+        self._okx_ord.addItem("Limit", "limit")
+        self._okx_ord.currentIndexChanged.connect(self._on_order_kind)
+        self._limit_edited = False
+        buy = QPushButton("Al")
+        sell = QPushButton("Sat")
+        buy.clicked.connect(lambda: self._manual_order("up"))
+        sell.clicked.connect(lambda: self._manual_order("down"))
+        trade_row.addWidget(self._okx_ord)
+        trade_row.addWidget(buy)
+        trade_row.addWidget(sell)
+        trade_row.addStretch(1)
+        manual_column.addLayout(trade_row)
+        guard = QHBoxLayout()
+        self._okx_tp = QLineEdit()
+        self._okx_tp.setPlaceholderText("Take profit")
+        self._okx_sl = QLineEdit()
+        self._okx_sl.setPlaceholderText("Stop loss")
+        guard.addWidget(self._okx_tp)
+        guard.addWidget(self._okx_sl)
+        manual_column.addLayout(guard)
+        self._okx_limit = QLineEdit()
+        self._okx_limit.setPlaceholderText("Limit fiyat")
+        self._okx_limit.setVisible(False)
+        self._okx_limit.textEdited.connect(self._mark_limit_edited)
+        manual_column.addWidget(self._okx_limit)
+        self._okx_liq = QLabel("Likidasyon · bakiye bekleniyor")
+        self._okx_liq.setWordWrap(True)
+        self._okx_liq.setStyleSheet("color: #a1a1aa; font-size: 11px;")
+        manual_column.addWidget(self._okx_liq)
+        manual_column.addStretch(1)
+        self._okx_stack.addWidget(auto)
+        self._okx_stack.addWidget(manual)
+        column.addWidget(self._okx_stack, 1)
+        manual_on = str(data.get("okx_form_page") or "otomatik") == "manuel"
+        self._okx_manual_page.setChecked(manual_on)
+        self._okx_auto_page.setChecked(not manual_on)
+        self._okx_stack.setCurrentIndex(1 if manual_on else 0)
+        self._okx_auto_page.clicked.connect(lambda: self._show_okx_page(False))
+        self._okx_manual_page.clicked.connect(lambda: self._show_okx_page(True))
         self._okx_log = QLabel("Son emir yok")
         self._okx_log.setWordWrap(True)
         self._okx_log.setStyleSheet("color: #e4e4e7;")
@@ -6951,7 +7030,9 @@ class MainWindow(QMainWindow):
         column.addWidget(self._okx_log)
         self._show_okx_log()
         column.addStretch(1)
+        self._okx_form_ready = True
         self._paint_okx_size()
+        self._refresh_okx_cap()
         active = self._build_active()
         active.setMinimumWidth(280)
         panels.addWidget(form, 1)
@@ -7005,7 +7086,7 @@ class MainWindow(QMainWindow):
         orders.setMaximumHeight(180)
         order_header = orders.horizontalHeader()
         order_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        for name in ("Tür", "Durum", "İşlem"):
+        for name in ("Tür", "Durum", "TP", "SL", "İşlem"):
             order_header.setSectionResizeMode(ORDER_COLUMNS.index(name), QHeaderView.ResizeMode.ResizeToContents)
         orders.itemDoubleClicked.connect(self._open_order_chart)
         self._okx_orders_table = orders
@@ -7113,14 +7194,22 @@ class MainWindow(QMainWindow):
             return
         self._okx_cap = cap
         self._okx_cap_symbol = symbol
-        if int(self._okx_lever.value()) <= cap:
-            self._okx_lever_ok = int(self._okx_lever.value())
+        over = False
+        for box, remembered in (
+            (self._okx_lever, "_okx_lever_ok"),
+            (self._okx_auto_lever, "_okx_auto_lever_ok"),
+        ):
+            if int(box.value()) <= cap:
+                setattr(self, remembered, int(box.value()))
+                continue
+            over = True
+            self._lever_hold = True
+            box.setValue(cap)
+            self._lever_hold = False
+            setattr(self, remembered, cap)
+        if not over:
             return
         self.statusBar().showMessage(f"OKX bu sözleşmede en fazla {cap}x kaldıraca izin veriyor")
-        self._lever_hold = True
-        self._okx_lever.setValue(cap)
-        self._lever_hold = False
-        self._okx_lever_ok = cap
         self._save_okx_form()
 
     def _on_okx_cap_fail(self, symbol: str) -> None:
@@ -7140,8 +7229,26 @@ class MainWindow(QMainWindow):
         self._okx_lever_ok = int(value)
         self._save_okx_form()
 
+    def _on_auto_lever_changed(self, value: int) -> None:
+        if self._lever_hold:
+            return
+        cap = self._okx_cap if self._okx_cap_symbol == self._symbol else None
+        if cap and value > cap:
+            self.statusBar().showMessage(f"OKX bu sözleşmede en fazla {cap}x kaldıraca izin veriyor")
+            self._lever_hold = True
+            previous = self._okx_auto_lever_ok
+            self._okx_auto_lever.setValue(previous if 1 <= previous <= cap else cap)
+            self._lever_hold = False
+            return
+        self._okx_auto_lever_ok = int(value)
+        self._save_okx_form()
+
+    def _show_okx_page(self, manual: bool) -> None:
+        self._okx_stack.setCurrentIndex(1 if manual else 0)
+        self._save_okx_form()
+
     def _save_okx_form(self) -> None:
-        if not hasattr(self, "_okx_enabled"):
+        if not getattr(self, "_okx_form_ready", False):
             return
         windows = [label for label, action in self._okx_window_actions.items() if action.isChecked()]
         signals = [label for label, action in self._okx_signal_actions.items() if action.isChecked()]
@@ -7149,6 +7256,8 @@ class MainWindow(QMainWindow):
             okx_enabled=self._okx_enabled.isChecked(),
             okx_simulated=self._okx_simulated.isChecked(),
             okx_leverage=int(self._okx_lever.value()),
+            okx_auto_leverage=int(self._okx_auto_lever.value()),
+            okx_form_page="manuel" if self._okx_manual_page.isChecked() else "otomatik",
             okx_risk_pct=float(self._okx_risk.value()),
             okx_margin_pct=int(self._okx_margin.value()),
             okx_mgn_mode=str(self._okx_mode.currentData() or "cross"),
@@ -8586,7 +8695,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _stop_level(self, verdict: str, hours: int, price: float | None) -> float | None:
-        """Kendi taraftaki en yakın küme. Take profit'in baktığı taraf değildir."""
+        """En büyük kendi taraf kümesinin 200 dolar ötesi. Short üstte, long altta."""
         side = _trade_side(verdict)
         if side is None or not isinstance(price, (int, float)) or float(price) <= 0:
             return None
@@ -8597,8 +8706,13 @@ class MainWindow(QMainWindow):
             if table is None or table.symbol != self._symbol:
                 continue
             level = table.nearest_stop(side, float(price))
-            if _sl_beyond(side, level, float(price)):
-                return float(level)
+            if not isinstance(level, (int, float)):
+                continue
+            beyond = float(level) + TP_OFFSET if side == "down" else float(level) - TP_OFFSET
+            if beyond >= 1:
+                beyond = float(round(beyond))
+            if beyond > 0 and _sl_beyond(side, beyond, float(price)):
+                return beyond
         return None
 
     def _trap_bucket(self, verdict: str, hours: int, price: float) -> float | None:
@@ -8818,6 +8932,7 @@ class MainWindow(QMainWindow):
             "margin_pct": pct,
             "risk_pct": _risk_pct(data),
             "leverage": leverage,
+            "lever_cap": _auto_leverage(data),
             "mgn_mode": mode if mode in ("cross", "isolated") else "cross",
             "simulated": bool(data.get("okx_simulated")),
             "windows": windows,
@@ -8931,6 +9046,7 @@ class MainWindow(QMainWindow):
                 "margin_pct": settings["margin_pct"],
                 "risk_pct": settings["risk_pct"],
                 "leverage": settings["leverage"],
+                "lever_cap": settings["lever_cap"],
                 "mgn_mode": settings["mgn_mode"],
                 "simulated": settings["simulated"],
             },
@@ -9160,6 +9276,8 @@ class MainWindow(QMainWindow):
                 (_price_text(order.get("px")), FLAT),
                 (size, FLAT),
                 (state, FLAT),
+                (_price_text(order.get("tp")), UP if order.get("tp") else MUTED),
+                (_price_text(order.get("sl")), DOWN if order.get("sl") else MUTED),
             ]
             for column, (text, color) in enumerate(cells):
                 item = table.item(row, column)
@@ -9190,11 +9308,11 @@ class MainWindow(QMainWindow):
         holder = QWidget()
         row = QHBoxLayout(holder)
         row.setContentsMargins(2, 0, 2, 0)
-        button = QPushButton("İptal")
-        button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.setStyleSheet("padding: 1px 8px;")
-        button.clicked.connect(lambda _checked=False, key=key: self._cancel_okx_order(key))
-        row.addWidget(button)
+        cancel = QPushButton("İptal")
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.setStyleSheet("padding: 1px 8px;")
+        cancel.clicked.connect(lambda _checked=False, key=key: self._cancel_okx_order(key))
+        row.addWidget(cancel)
         return holder
 
     def _open_order_chart(self, item) -> None:
@@ -9310,11 +9428,23 @@ class MainWindow(QMainWindow):
             return
         name = base_of(self._symbol)
         word = "long" if side == "up" else "short"
+        try:
+            tp = _parse_price(self._okx_tp.text())
+            sl = _parse_price(self._okx_sl.text())
+        except ValueError:
+            self.statusBar().showMessage("TP ve SL sayı olmalı")
+            return
         where = "piyasa fiyatından" if limit is None else f"{format_price(limit)} limit fiyatından"
+        guards = []
+        if tp is not None:
+            guards.append(f"TP {format_price(tp)}")
+        if sl is not None:
+            guards.append(f"SL {format_price(sl)}")
+        extra = f" · {' · '.join(guards)}" if guards else ""
         answer = QMessageBox.question(
             self,
             "Emir gönder",
-            f"{name} {word} · bakiyenin %{pct}'i × {lever}x {where} açılacak.",
+            f"{name} {word} · bakiyenin %{pct}'i × {lever}x {where} açılacak{extra}.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -9332,6 +9462,10 @@ class MainWindow(QMainWindow):
         }
         if limit is not None:
             job["limit"] = float(limit)
+        if tp is not None:
+            job["tp"] = float(tp)
+        if sl is not None:
+            job["sl"] = float(sl)
         self._send_okx_action(job)
 
     def _close_okx_position(self, key: str) -> None:
@@ -9355,8 +9489,9 @@ class MainWindow(QMainWindow):
         creds, simulated = self._okx_account()
         if not creds.ready():
             return
-        self._okx_live_note.setText("Emir gönderiliyor…")
-        self._okx_live_note.setStyleSheet("color: #a1a1aa;")
+        note = self._okx_order_note if job.get("kind") in ("cancel", "order_tpsl") else self._okx_live_note
+        note.setText("Emir gönderiliyor…")
+        note.setStyleSheet("color: #a1a1aa;")
         worker = _OkxAction(creds, simulated, job)
         worker.done.connect(self._on_okx_action)
         self._launch(worker, "_okx_action_worker")
