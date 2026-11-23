@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 # 0.0100 hâlâ pozitif sayılır; aşırı ancak bunun üstüdür. 15dk oi gürültüsü ayrı.
@@ -20,6 +21,28 @@ PERIODS: tuple[tuple[str, float | None], ...] = (
 
 LONGS = {"Sağlıklı Long", "Short Squeeze", "Akümülasyon"}
 SHORTS = {"Sağlıklı Short", "Long Squeeze", "Dağıtım"}
+
+# Alt sınır açık, üst sınır kapalı. Nötr (4 haneye yuvarlanmış sıfır) düşük banda dahildir.
+TREND_LONG = {
+    "trend_long_aktif": True,
+    "fund_ust": 0.0100,
+    "funding_bandlari": (
+        ("düşük", 0.0, 0.0050),
+        ("normal", 0.0050, 0.0100),
+    ),
+    "parametre_versiyonu": 1,
+}
+
+# Sıfıra bakan sınır açık, uzak sınır kapalı. Nötr yine düşük bandadır.
+TREND_SHORT = {
+    "trend_short_aktif": True,
+    "fund_alt": -0.0100,
+    "funding_bandlari": (
+        ("düşük", -0.0050, 0.0),
+        ("normal", -0.0100, -0.0050),
+    ),
+    "parametre_versiyonu": 1,
+}
 
 
 @dataclass(frozen=True)
@@ -60,7 +83,64 @@ def cvd_durumu(cvd_spot: float, cvd_perp: float) -> str:
     return f"Spot {spot_yon} / Perp {perp_yon} ({etiket})"
 
 
-def genel_durum(fund_status: str, oi_status: str, price_status: str, cvd_spot: float, cvd_perp: float):
+def trend_long_bandi(funding: float) -> str | None:
+    """Ham funding'in kayıt bandı. Nötr düşük bandadır. Kapıya uymayan None."""
+    if not math.isfinite(funding):
+        return None
+    if funding_label(funding) == "Nötr":
+        return "düşük"
+    raw = float(funding)
+    for name, low, high in TREND_LONG["funding_bandlari"]:
+        if low < raw <= high:
+            return name
+    return None
+
+
+def _trend_long(price_status: str, oi_status: str, cvd_spot: float, funding: float | None) -> bool:
+    if not TREND_LONG["trend_long_aktif"]:
+        return False
+    if price_status != "Artıyor" or oi_status != "Artıyor" or not cvd_spot > 0:
+        return False
+    if funding is None or not math.isfinite(funding):
+        return False
+    if funding_label(funding) == "Nötr":
+        return True
+    return 0 < float(funding) <= float(TREND_LONG["fund_ust"])
+
+
+def trend_short_bandi(funding: float) -> str | None:
+    """Ham funding'in short kayıt bandı. Nötr düşük bandadır. Kapıya uymayan None."""
+    if not math.isfinite(funding):
+        return None
+    if funding_label(funding) == "Nötr":
+        return "düşük"
+    raw = float(funding)
+    for name, low, high in TREND_SHORT["funding_bandlari"]:
+        if low <= raw < high:
+            return name
+    return None
+
+
+def _trend_short(price_status: str, oi_status: str, cvd_spot: float, funding: float | None) -> bool:
+    if not TREND_SHORT["trend_short_aktif"]:
+        return False
+    if price_status != "Düşüyor" or oi_status != "Artıyor" or not cvd_spot < 0:
+        return False
+    if funding is None or not math.isfinite(funding):
+        return False
+    if funding_label(funding) == "Nötr":
+        return True
+    return float(TREND_SHORT["fund_alt"]) <= float(funding) < 0
+
+
+def genel_durum(
+    fund_status: str,
+    oi_status: str,
+    price_status: str,
+    cvd_spot: float,
+    cvd_perp: float,
+    funding: float | None = None,
+):
     fund_positive = fund_status in {"Pozitif", "Aşırı Pozitif"}
     fund_negative = fund_status in {"Negatif", "Aşırı Negatif"}
 
@@ -93,6 +173,12 @@ def genel_durum(fund_status: str, oi_status: str, price_status: str, cvd_spot: f
             return "Akümülasyon", None
         if cvd_spot < 0 and abs(cvd_spot) >= abs(cvd_perp):
             return "Dağıtım", None
+
+    if _trend_long(price_status, oi_status, cvd_spot, funding):
+        return "Trend Long", None
+
+    if _trend_short(price_status, oi_status, cvd_spot, funding):
+        return "Trend Short", None
 
     return "İşlem Açma", None
 
@@ -177,7 +263,7 @@ def build_reads(
             result, trap = "Veri Bekleniyor", None
         else:
             cvd = cvd_durumu(spot, perp_cvd)
-            result, trap = genel_durum(fund, oi, price, spot, perp_cvd)
+            result, trap = genel_durum(fund, oi, price, spot, perp_cvd, funding_percent)
         reads.append(
             Read(
                 label=label,

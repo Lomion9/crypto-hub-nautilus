@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import math
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -738,33 +739,129 @@ def _place_tp(creds: Creds, held: dict, tp_text: str, simulated: bool) -> str:
     return _algo_id(payload)
 
 
+def acilis_engelli(halted: bool, label: str, blocked: set[str]) -> bool:
+    """Bir kapanış başarısızsa sonraki açılışlar da gitmez."""
+    return halted or label in blocked
+
+
+def _owned_sides(settings: dict) -> set[str]:
+    raw = settings.get("owned_sides")
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    return {str(side) for side in raw if side in ("up", "down")}
+
+
+def _foreign_live(creds: Creds, symbol: str, owned: set[str], simulated: bool) -> str:
+    """clear, foreign veya unknown. Okunamayan defterde emir yazılmaz."""
+    inst = inst_id(symbol)
+    try:
+        rows = fetch_positions(creds, simulated)
+    except OkxError:
+        return "unknown"
+    for position in rows:
+        if position.get("inst") != inst or not str(position.get("sz") or ""):
+            continue
+        if position.get("side") not in owned:
+            return "foreign"
+    return "clear"
+
+
+def _balance_settled(creds: Creds, before: float, simulated: bool) -> float:
+    """Kapanışın serbest bıraktığı tutar bakiyeye yazılınca yeni emir açılır."""
+    last = before
+    for _ in range(5):
+        try:
+            current = available_usdt(creds, simulated)
+        except OkxError:
+            return last
+        last = current
+        if current > before + 0.5:
+            return current
+        time.sleep(0.4)
+    return last
+
+
 def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: list[dict]) -> list[dict]:
-    """Kapat, sonra aç. Kapanış başarısızsa aynı aralığın yeni emri gitmez."""
+    """Kapat, sonra aç. Elle pozisyona dokunulmaz. Kapanış bakiyeye yazılmadan açılış gitmez."""
     results: list[dict] = []
     blocked: set[str] = set()
+    halted = False
+    closed = False
+    balance_before = 0.0
     mode = str(settings.get("mgn_mode") or "cross")
     if mode not in ("cross", "isolated"):
         mode = "cross"
     simulated = bool(settings.get("simulated"))
+    owned = _owned_sides(settings)
+    book = _foreign_live(creds, symbol, owned, simulated)
+    if book == "foreign":
+        return [_row(symbol, "", "open", False, "emir gitmedi: elle pozisyon duruyor", None)]
+    if book == "unknown":
+        return [_row(symbol, "", "open", False, "emir gitmedi: pozisyon okunamadı", None)]
     for action in actions:
         label = str(action.get("label") or "")
         op = str(action.get("op") or "")
         if op == "close":
             held = action.get("held")
-            if not isinstance(held, dict) or not held.get("sz"):
+            if not isinstance(held, dict) or held.get("manual"):
+                results.append(_row(symbol, label, op, True, "elle pozisyon duruyor", None))
+                continue
+            if not held.get("sz"):
                 results.append(_row(symbol, label, op, True, "açık emir yok", None))
                 continue
             try:
+                if balance_before <= 0:
+                    balance_before = available_usdt(creds, simulated)
                 _drop_limits(creds, held, simulated)
                 held = _live_size(creds, held, simulated)
-                _close(creds, held, simulated)
+                if held.get("sz"):
+                    _close(creds, held, simulated)
+                closed = True
                 results.append(_row(symbol, label, op, True, "kapatıldı", None))
             except OkxError as exc:
                 if _flat(str(exc)):
                     results.append(_row(symbol, label, op, True, "pozisyon zaten kapalı", None))
                 else:
+                    halted = True
                     blocked.add(label)
                     results.append(_row(symbol, label, op, False, str(exc), None))
+            continue
+        if op == "drop":
+            held = action.get("held")
+            if not isinstance(held, dict) or held.get("manual"):
+                results.append(_row(symbol, label, op, False, "emir gitmedi: elle pozisyon duruyor", None))
+                continue
+            _drop_limits(creds, held, simulated)
+            kept = dict(held)
+            kept["limits"] = []
+            results.append(_row(symbol, label, op, True, "limitler iptal edildi", kept))
+            continue
+        if op == "guard":
+            held = action.get("held")
+            if not isinstance(held, dict) or held.get("manual"):
+                results.append(_row(symbol, label, op, False, "emir gitmedi: elle pozisyon duruyor", None))
+                continue
+            try:
+                raw_tp = action.get("tp")
+                raw_sl = action.get("sl")
+                tp = float(raw_tp) if isinstance(raw_tp, (int, float)) and float(raw_tp) > 0 else None
+                sl = float(raw_sl) if isinstance(raw_sl, (int, float)) and float(raw_sl) > 0 else None
+                book = dict(held)
+                if book.get("algo_id"):
+                    book["tp_sl_ids"] = [str(book.get("algo_id"))]
+                updated = set_tp_sl(creds, book, tp, sl, simulated)
+            except (OkxError, TypeError, ValueError) as exc:
+                text = str(exc) if str(exc) else "TP/SL güncellenemedi"
+                results.append(_row(symbol, label, op, False, text, None))
+                continue
+            kept = dict(held)
+            if updated.get("tp"):
+                kept["tp"] = updated["tp"]
+            if updated.get("sl"):
+                kept["sl"] = updated["sl"]
+            if updated.get("algo_id"):
+                kept["algo_id"] = updated["algo_id"]
+            results.append(_row(symbol, label, op, True, str(updated.get("message") or "TP/SL güncellendi"), kept))
             continue
         if op == "amend":
             held = action.get("held")
@@ -794,7 +891,7 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
             continue
         if op not in ("open", "scale"):
             continue
-        if label in blocked:
+        if acilis_engelli(halted, label, blocked):
             results.append(_row(symbol, label, op, False, "önceki pozisyon kapanmadı", None))
             continue
         try:
@@ -813,6 +910,8 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
             if risk_pct <= 0:
                 raise OkxError("İşlem riski seçilmedi")
             equity = available_usdt(creds, simulated)
+            if closed:
+                equity = _balance_settled(creds, balance_before, simulated)
             if equity <= 0:
                 raise OkxError("Kullanılabilir bakiye yok")
             if side == "up" and float(raw_sl) >= spot:
@@ -826,7 +925,15 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
             leverage, margin = size_for_risk(
                 symbol, equity, risk_pct, spot, float(raw_sl), mode, max(0, user_cap)
             )
-            parts = 3 if op == "scale" else 1
+            budget = str(action.get("budget") or "risk")
+            if budget == "third":
+                margin = equity
+                parts = 3
+            elif budget == "rest":
+                margin = equity
+                parts = 1
+            else:
+                parts = 3 if op == "scale" else 1
             opened = _open(
                 creds, symbol, side, float(raw_tp), spot, margin / parts, leverage, mode, simulated, sl=float(raw_sl)
             )
@@ -865,10 +972,25 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
         position = {key: opened[key] for key in ("inst", "side", "pos_side", "sz", "td_mode", "tp", "algo_id")}
         if isinstance(opened.get("sl"), (int, float)) and float(opened.get("sl") or 0) > 0:
             position["sl"] = float(opened["sl"])
+        if action.get("family"):
+            position["family"] = str(action.get("family"))
         if limits:
             position["limits"] = limits
         results.append(_row(symbol, label, "open", True, " · ".join(notes), position))
     return results
+
+
+def _flatten_inst(creds: Creds, symbol: str, simulated: bool) -> None:
+    """Açılıştan önce bu sözleşmede duran pozisyonu kapatır."""
+    inst = inst_id(symbol)
+    for position in fetch_positions(creds, simulated):
+        if position.get("inst") != inst or not str(position.get("sz") or ""):
+            continue
+        try:
+            _close(creds, position, simulated)
+        except OkxError as exc:
+            if not _flat(str(exc)):
+                raise
 
 
 def _drop_limits(creds: Creds, held: dict, simulated: bool) -> None:
@@ -901,7 +1023,9 @@ def _live_size(creds: Creds, held: dict, simulated: bool) -> dict:
         sized = dict(held)
         sized["sz"] = position["sz"]
         return sized
-    return held
+    gone = dict(held)
+    gone["sz"] = ""
+    return gone
 
 
 _INSTRUMENTS: dict[str, dict] = {}

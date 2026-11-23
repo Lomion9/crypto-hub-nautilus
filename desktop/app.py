@@ -94,6 +94,7 @@ from desktop.indices import (
     release_memory as release_indices,
 )
 from desktop.liq_tape import DECISION_SYMBOL, LiquidationTape
+from desktop.trend_kayit import trend_satiri, trend_short_satiri
 from desktop.liquidity import LiquidityMap, clip_map, load_liquidity
 from desktop.okx_trade import (
     Creds,
@@ -189,7 +190,10 @@ ORDER_SIGNALS = (
     "Dağıtım",
     "Long Trap",
     "Short Trap",
+    "Trend Long",
+    "Trend Short",
 )
+_ONCEKI_SINYALLER = ORDER_SIGNALS[:-2]
 SIGNAL_MARK_BARS = 500
 SIGNAL_BAR_MS = {
     "1sa": 3_600_000,
@@ -197,8 +201,42 @@ SIGNAL_BAR_MS = {
     "24sa": 86_400_000,
     "1hafta": 7 * 86_400_000,
 }
+
+
+_WEEK_ALIGN_MS = 3 * 86_400_000
+
+
+def _signal_mark(now_ms: int, label: str) -> int:
+    """Mum kimliği. Saat başı, 4 saat, gece 03:00 ve pazar 03:00 UTC ızgarasına oturur."""
+    bar = SIGNAL_BAR_MS[label]
+    if label == "1hafta":
+        return (int(now_ms) - _WEEK_ALIGN_MS) // bar
+    return int(now_ms) // bar
+
+
+def _seed_signal_marks(now_ms: int) -> dict[str, int]:
+    """Açılışta görülen mum emir sayılmaz. Yalnız bu andan sonra kapanan mum işlenir."""
+    return {label: _signal_mark(now_ms, label) for label in SIGNAL_WINDOWS}
+
+
+def _newly_due(now_ms: int, seen: dict) -> list[str]:
+    return [label for label in SIGNAL_WINDOWS if seen.get(label) != _signal_mark(now_ms, label)]
+
+
+def _closed_candle_ready(closed_ms, now_ms: int, bar_ms: int, label: str = "") -> bool:
+    """Kapanmış mum, az önce biten aralığın kendisiyse hazırdır."""
+    if not isinstance(closed_ms, int) or bar_ms <= 0:
+        return False
+    if label == "1hafta":
+        origin = (int(now_ms) - _WEEK_ALIGN_MS) // bar_ms
+        expect = origin * bar_ms + _WEEK_ALIGN_MS - bar_ms
+        return int(closed_ms) == expect
+    expect = (int(now_ms) // bar_ms - 1) * bar_ms
+    return int(closed_ms) == expect
 CHART_SIGNAL = {"1h": "1sa", "4h": "4sa", "1d": "24sa", "1w": "1hafta"}
 SIGNAL_LIQ_HOURS = {"1sa": 24, "4sa": 72, "24sa": 168, "1hafta": 720}
+ANALYSIS_HOURS = {**SIGNAL_LIQ_HOURS, "15dk": 24, "2sa": 24, "8sa": 72}
+TREND_SCORE = {"Trend Long", "Trend Short"}
 SIGNAL_EXPIRE_MS = {"1sa": 24 * 60 * 60 * 1000, "4sa": 3 * 24 * 60 * 60 * 1000}
 SIGNAL_COOL_MS = {
     "1sa": 60 * 60 * 1000,
@@ -207,6 +245,7 @@ SIGNAL_COOL_MS = {
     "1hafta": 7 * 24 * 60 * 60 * 1000,
 }
 TP_OFFSET = 200.0
+STOP_MIN_RATIO = 0.005
 LIQ_SPANS = (
     (12, "12 saat"),
     (24, "24 saat"),
@@ -1271,7 +1310,11 @@ def _chosen_signals(data: dict) -> set[str]:
     if raw is None:
         return set(ORDER_SIGNALS)
     if isinstance(raw, list):
-        return {str(item) for item in raw if str(item) in ORDER_SIGNALS}
+        chosen = {str(item) for item in raw if str(item) in ORDER_SIGNALS}
+        saved = {str(item) for item in raw}
+        if set(_ONCEKI_SINYALLER) <= saved:
+            chosen.update(TREND_SCORE)
+        return chosen
     return set(ORDER_SIGNALS)
 
 
@@ -1810,6 +1853,7 @@ class SnapshotWorker(QThread):
         enabled: set[str] | None = None,
         episodes: dict | None = None,
         tray: bool = False,
+        panels: bool = True,
     ) -> None:
         super().__init__()
         self._symbol = symbol
@@ -1817,6 +1861,7 @@ class SnapshotWorker(QThread):
         self._with_chart = with_chart
         self._enabled = None if enabled is None else set(enabled)
         self._tray = tray
+        self._panels = panels
         self._episodes = {
             label: dict(episode) if isinstance(episode, dict) else episode
             for label, episode in (episodes or {}).items()
@@ -1830,6 +1875,7 @@ class SnapshotWorker(QThread):
                 with_chart=self._with_chart,
                 enabled=self._enabled,
                 tray=self._tray,
+                panels=self._panels,
             )
             touches = {} if self._tray or not self._episodes else _episode_touch(self._symbol, self._episodes)
             self.done.emit(replace(snapshot, touches=touches))
@@ -3815,6 +3861,8 @@ def _episode_text(snapshot: Snapshot, event: _SignalEvent, window) -> str:
         head = f"{event.verdict} kapandı · take profit"
     elif event.kind == "sure":
         head = f"{event.verdict} süresi doldu"
+    elif event.kind == "stop":
+        head = f"{event.verdict} kapandı · stop"
     else:
         head = event.verdict
     tp = _take_profit(_trade_side(event.verdict), event.target)
@@ -4138,6 +4186,15 @@ class _SignalEvent:
         self.stop = stop
 
 
+def _stop_cok_yakin(price, sl) -> bool:
+    """Stop, ürün fiyatının %0.5'inden yakınsa otomatik emir hiç açılmaz."""
+    if not isinstance(price, (int, float)) or not isinstance(sl, (int, float)):
+        return False
+    if float(price) <= 0 or float(sl) <= 0:
+        return False
+    return abs(float(price) - float(sl)) / float(price) < STOP_MIN_RATIO
+
+
 def _sl_beyond(side: str | None, level, price) -> bool:
     """Long stop girişin altında, short stop girişin üstünde kalır."""
     if side not in ("up", "down"):
@@ -4204,9 +4261,9 @@ def _signal_kind(verdict: str) -> str:
 
 def _trade_side(verdict: str) -> str | None:
     """Long Trap aşağı, Short Trap yukarı. Diğer long sonuçlar yukarı, short sonuçlar aşağı."""
-    if verdict.startswith("Short Trap") or verdict in {"Sağlıklı Long", "Short Squeeze", "Akümülasyon"}:
+    if verdict == "Trend Long" or verdict.startswith("Short Trap") or verdict in {"Sağlıklı Long", "Short Squeeze", "Akümülasyon"}:
         return "up"
-    if verdict.startswith("Long Trap") or verdict in {"Sağlıklı Short", "Long Squeeze", "Dağıtım"}:
+    if verdict == "Trend Short" or verdict.startswith("Long Trap") or verdict in {"Sağlıklı Short", "Long Squeeze", "Dağıtım"}:
         return "down"
     return None
 
@@ -4225,12 +4282,17 @@ def _trade_return(side, entry, exit_px) -> float | None:
 
 
 def _score_note(label: str, kind: str, episode, exit_px) -> tuple:
+    verdict = str(episode.get("verdict") or "") if isinstance(episode, dict) else ""
     side = episode.get("side") if isinstance(episode, dict) else None
     entry = episode.get("entry") if isinstance(episode, dict) else None
+    if verdict == "Trend Long":
+        return ("Trend Long", kind, _trade_return(side or "up", entry, exit_px))
+    if verdict == "Trend Short":
+        return ("Trend Short", kind, _trade_return(side or "down", entry, exit_px))
     return (label, kind, _trade_return(side, entry, exit_px))
 
 
-def _episode_open(verdict: str, target, candle: int, spot) -> dict:
+def _episode_open(verdict: str, target, candle: int, spot, opened_ms=None) -> dict:
     side = _trade_side(verdict)
     entry_px = float(spot) if isinstance(spot, (int, float)) and float(spot) > 0 else None
     if not _tp_stays_beyond(side, target, entry_px):
@@ -4244,7 +4306,7 @@ def _episode_open(verdict: str, target, candle: int, spot) -> dict:
         "tp": tp,
         "entry": entry_px,
         "candle": candle,
-        "opened_ms": int(time.time() * 1000),
+        "opened_ms": int(opened_ms) if isinstance(opened_ms, (int, float)) and float(opened_ms) > 0 else int(time.time() * 1000),
     }
 
 
@@ -4269,6 +4331,141 @@ def _trap_limits(side: str | None, price: float, level: float) -> tuple[float, f
     if side == "up" and not (inner < mid < price):
         return None
     return mid, inner
+
+
+def _position_alive(row: dict | None) -> bool:
+    if not isinstance(row, dict) or row.get("manual"):
+        return False
+    text = str(row.get("sz") or "").strip()
+    if text and text not in {"0", "0.0"}:
+        return True
+    return bool(row.get("limits"))
+
+
+def _stored_trap(label: str, row: dict, episodes: dict, opening: str) -> str | None:
+    stored = row.get("family")
+    if stored in ("Long Trap", "Short Trap"):
+        return str(stored)
+    if label == opening:
+        return None
+    episode = episodes.get(label) if isinstance(episodes.get(label), dict) else {}
+    name = _order_signal(str(episode.get("verdict") or ""))
+    if name in ("Long Trap", "Short Trap"):
+        return name
+    return None
+
+
+def _guard_action(label: str, held: dict, episode: dict) -> dict:
+    return {
+        "op": "guard",
+        "label": label,
+        "held": dict(held),
+        "tp": episode.get("tp"),
+        "sl": episode.get("sl"),
+        "side": episode.get("side"),
+    }
+
+
+def _open_action(label: str, episode: dict, spot: float, op: str, budget: str, limits, family: str) -> dict:
+    action = {
+        "op": op,
+        "label": label,
+        "side": episode.get("side"),
+        "tp": episode.get("tp"),
+        "sl": episode.get("sl"),
+        "price": spot,
+        "budget": budget,
+        "family": family,
+    }
+    if limits:
+        action["limits"] = list(limits)
+    return action
+
+
+def _enter_note(spot, sl) -> str:
+    if _stop_cok_yakin(spot, sl):
+        return "emir gitmedi: stop fiyatın %0.5'inden yakın"
+    return "emir gitmedi: stop kümesi yok"
+
+
+def _plan_orders(events, coin: dict, episodes: dict, trap_limits: dict) -> tuple[list[dict], list[str]]:
+    """Açık otomatik işlemin yönüne ve tuzağın gerçekten durup durmadığına göre emir listesi."""
+    positions = {str(label): dict(row) for label, row in (coin or {}).items() if isinstance(row, dict)}
+    if any(row.get("manual") for row in positions.values()):
+        return [], ["emir gitmedi: elle pozisyon duruyor"]
+    actions: list[dict] = []
+    notes: list[str] = []
+
+    def autos() -> list[tuple[str, dict]]:
+        return [(label, row) for label, row in positions.items() if _position_alive(row)]
+
+    for event in events:
+        if event.kind in ("kapandi", "sure", "stop"):
+            row = positions.get(event.label)
+            if _position_alive(row):
+                actions.append({"op": "close", "label": event.label, "held": dict(row)})
+                positions.pop(event.label, None)
+            continue
+        episode = episodes.get(event.label) if isinstance(episodes.get(event.label), dict) else {}
+        if event.kind == "hedef":
+            row = positions.get(event.label)
+            if _position_alive(row):
+                actions.append(_guard_action(event.label, row, episode))
+            continue
+        if event.kind != "yeni":
+            continue
+        family = _order_signal(event.verdict)
+        side = episode.get("side")
+        entry = episode.get("entry")
+        spot = float(entry) if isinstance(entry, (int, float)) and float(entry) > 0 else 0.0
+        sl = episode.get("sl")
+        can = bool(spot > 0 and _sl_beyond(side, sl, spot) and not _stop_cok_yakin(spot, sl))
+        open_rows = autos()
+        if family in ("Long Trap", "Short Trap"):
+            if any(_stored_trap(label, row, episodes, event.label) == family for label, row in open_rows):
+                continue
+            levels = trap_limits.get(event.label)
+            if not can or not levels:
+                notes.append(_enter_note(spot, sl) if not can else "emir gitmedi: ters likidite girişe çok yakın")
+                continue
+            for label, row in list(open_rows):
+                actions.append({"op": "close", "label": label, "held": dict(row)})
+                positions.pop(label, None)
+            actions.append(_open_action(event.label, episode, spot, "scale", "third", levels, family))
+            positions[event.label] = {"side": side, "sz": "1", "family": family, "limits": ["bekliyor"]}
+            continue
+        same = [(label, row) for label, row in open_rows if row.get("side") == side]
+        other = [(label, row) for label, row in open_rows if row.get("side") != side]
+        trap_same = [item for item in same if _stored_trap(item[0], item[1], episodes, event.label)]
+        if trap_same:
+            if not can:
+                notes.append(_enter_note(spot, sl))
+                continue
+            for label, row in trap_same:
+                if row.get("limits"):
+                    actions.append({"op": "drop", "label": label, "held": dict(row)})
+                kept = dict(row)
+                kept["limits"] = []
+                kept["family"] = ""
+                positions[label] = kept
+            actions.append(_open_action(event.label, episode, spot, "open", "rest", None, family))
+            actions.append(_guard_action(trap_same[0][0], trap_same[0][1], episode))
+            positions[event.label] = {"side": side, "sz": "1", "family": family}
+            continue
+        if same:
+            if can:
+                for label, row in same:
+                    actions.append(_guard_action(label, row, episode))
+            continue
+        if not can:
+            notes.append(_enter_note(spot, sl))
+            continue
+        for label, row in other:
+            actions.append({"op": "close", "label": label, "held": dict(row)})
+            positions.pop(label, None)
+        actions.append(_open_action(event.label, episode, spot, "open", "risk", None, family))
+        positions[event.label] = {"side": side, "sz": "1", "family": family}
+    return actions, notes
 
 
 def _signal_clock(opened_ms) -> str:
@@ -4338,6 +4535,36 @@ def _tp_reached(side, tp, entry, high, low) -> bool:
     if side == "up" and float(high) >= float(tp):
         return True
     return side == "down" and float(low) <= float(tp)
+
+
+def _stop_reached(side, sl, entry, high, low) -> bool:
+    """Long stopun altına, short stopun üstüne gelen fiyat sinyali kapatır."""
+    if side not in ("up", "down") or high is None or low is None:
+        return False
+    if not _sl_beyond(side, sl, entry):
+        return False
+    if side == "up":
+        return float(low) <= float(sl)
+    return float(high) >= float(sl)
+
+
+def _stopped_episode(label: str, episode: dict, closed_ms: int):
+    failed = str(episode.get("verdict") or "")
+    shown = episode.get("target")
+    target = float(shown) if isinstance(shown, (int, float)) and float(shown) > 0 else None
+    rest = {
+        "verdict": "",
+        "quiet": True,
+        "target": None,
+        "side": None,
+        "tp": None,
+        "entry": None,
+        "candle": closed_ms,
+        "wait": "",
+    }
+    event = _SignalEvent(label, "stop", failed, target)
+    note = _score_note(label, "miss", episode, episode.get("sl"))
+    return rest, event, note
 
 
 def _episode_touch(symbol: str, episodes: dict) -> dict[str, tuple[float, float]]:
@@ -4423,6 +4650,13 @@ def _advance_signal(
                 notes.append(_score_note(label, "hit", episode, tp))
                 entry[label] = _tp_rest(label, str(episode["verdict"]), closed_ms)
                 continue
+            if _stop_reached(side, episode.get("sl"), episode.get("entry"), span[0], span[1]):
+                dirty = True
+                rest, event, note = _stopped_episode(label, episode, closed_ms)
+                events.append(event)
+                notes.append(note)
+                entry[label] = rest
+                continue
         if same_candle and not (
             episode is not None and episode.get("verdict") and _signal_expired(label, episode)
         ) and not _cool_bypass(episode, verdict):
@@ -4442,6 +4676,12 @@ def _advance_signal(
                 events.append(_SignalEvent(label, "kapandi", str(episode["verdict"]), shown))
                 notes.append(_score_note(label, "hit", episode, tp))
                 entry[label] = _tp_rest(label, str(episode["verdict"]), closed_ms)
+                continue
+            if _stop_reached(side, episode.get("sl"), episode.get("entry"), high, low):
+                rest, event, note = _stopped_episode(label, episode, closed_ms)
+                events.append(event)
+                notes.append(note)
+                entry[label] = rest
                 continue
             if _signal_expired(label, episode):
                 notes.append(_score_note(label, "miss", episode, spot))
@@ -4464,7 +4704,7 @@ def _advance_signal(
         if episode is None:
             if real:
                 target = targets.get(label)
-                entry[label] = _episode_open(verdict, target, closed_ms, spot)
+                entry[label] = _episode_open(verdict, target, closed_ms, spot, int(closed_ms) + SIGNAL_BAR_MS.get(label, 0))
                 events.append(_SignalEvent(label, "yeni", verdict, target))
             else:
                 entry[label] = {
@@ -4492,7 +4732,7 @@ def _advance_signal(
             until = episode.get("cool_until")
             if isinstance(until, (int, float)) and float(until) > 0 and not _cooling(episode):
                 target = targets.get(label)
-                entry[label] = _episode_open(verdict, target, closed_ms, spot)
+                entry[label] = _episode_open(verdict, target, closed_ms, spot, int(closed_ms) + SIGNAL_BAR_MS.get(label, 0))
                 events.append(_SignalEvent(label, "yeni", verdict, target))
                 continue
             kept = dict(episode)
@@ -4524,7 +4764,12 @@ def _advance_signal(
         target = targets.get(label)
         new_side = _trade_side(verdict)
         old_side = episode.get("side") or _trade_side(str(episode.get("verdict") or ""))
-        if new_side and new_side == old_side:
+        if (
+            new_side
+            and new_side == old_side
+            and episode.get("verdict") not in TREND_SCORE
+            and verdict not in TREND_SCORE
+        ):
             kept = dict(episode)
             kept["verdict"] = verdict
             kept["quiet"] = False
@@ -4547,7 +4792,7 @@ def _advance_signal(
             continue
         if episode.get("verdict"):
             notes.append(_score_note(label, "miss", episode, spot))
-        entry[label] = _episode_open(verdict, target, closed_ms, spot)
+        entry[label] = _episode_open(verdict, target, closed_ms, spot, int(closed_ms) + SIGNAL_BAR_MS.get(label, 0))
         events.append(_SignalEvent(label, "yeni", verdict, target))
     if not dirty:
         return book, [], []
@@ -4564,7 +4809,7 @@ def _bump_score(raw, symbol: str, notes: list[tuple]) -> dict:
         label = item[0]
         kind = item[1]
         pnl = item[2] if len(item) > 2 else None
-        if kind not in ("hit", "miss") or label not in SIGNAL_WINDOWS:
+        if kind not in ("hit", "miss") or (label not in SIGNAL_WINDOWS and label not in TREND_SCORE):
             continue
         row = dict(entry.get(label) or {})
         try:
@@ -5540,18 +5785,18 @@ class LiquidityWorker(QThread):
     done = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, symbol: str, span: int = 0, conserved: bool = False) -> None:
+    def __init__(self, symbol: str, span: int = 0, conserved: bool = False, hours: set[int] | None = None) -> None:
         super().__init__()
         self._symbol = symbol
         self._span = span
         self._conserved = conserved
+        self._hours = set(hours or ())
 
     def run(self) -> None:
         try:
             book = load_liquidity(self._symbol)
-            clips, targets = _clip_set(
-                book, {self._span} if self._span > 0 else set(), set(SIGNAL_LIQ_HOURS.values()), self._conserved
-            )
+            hours = set(self._hours) if self._hours else set(SIGNAL_LIQ_HOURS.values())
+            clips, targets = _clip_set(book, hours, hours, self._conserved)
             self.done.emit({"book": book, "clips": clips, "targets": targets})
         except MarketError as exc:
             self.failed.emit(str(exc))
@@ -5714,6 +5959,11 @@ class MainWindow(QMainWindow):
         self._background = False
         self._tray_hour_id: int | None = None
         self._tray_snap_gen: int | None = None
+        self._signal_seen = _seed_signal_marks(int(time.time() * 1000))
+        self._signal_due: set[str] = set()
+        self._signal_retried = False
+        self._signal_hours: set[int] = set()
+        self._decide_gen: int | None = None
         self._page = "market"
         self._quitting = False
         self._live_price: float | None = None
@@ -6229,7 +6479,12 @@ class MainWindow(QMainWindow):
         )
         score = _read_state().get("signal_score")
         coin = score.get(self._symbol) if isinstance(score, dict) else {}
-        text = f"{label}  {_score_line(coin if isinstance(coin, dict) else {}, label)}"
+        coin = coin if isinstance(coin, dict) else {}
+        text = f"{label}  {_score_line(coin, label)}"
+        for name in ("Trend Long", "Trend Short"):
+            trend = _score_line(coin, name)
+            if trend != "doğruluk henüz yok":
+                text = f"{text}  ·  {name} {trend}"
         self.price_view.set_signals(marks, text)
 
     def _store_bb(self) -> None:
@@ -7578,19 +7833,27 @@ class MainWindow(QMainWindow):
         generation = self._liq_gen
         if self._liq_map is None or self._liq_map.symbol != self._symbol:
             self._heat.set_state(None, "Yükleniyor")
-        worker = LiquidityWorker(self._symbol, self._liq_span, self._liq_conserved)
+        hours = set(self._signal_hours)
+        if self._liq_span:
+            hours.add(self._liq_span)
+        if not hours:
+            hours = set(SIGNAL_LIQ_HOURS.values())
+        worker = LiquidityWorker(self._symbol, self._liq_span, self._liq_conserved, hours)
         worker.done.connect(lambda payload, gen=generation: self._on_liquidity(gen, payload))
         worker.failed.connect(lambda message, gen=generation: self._on_liquidity_fail(gen, message))
         self._launch(worker, "_liq_worker")
 
     def _on_liquidity(self, generation: int, payload: dict) -> None:
         book = payload.get("book") if isinstance(payload, dict) else None
-        if self._background or generation != self._liq_gen or book is None or book.symbol != self._symbol:
+        if generation != self._liq_gen or book is None or book.symbol != self._symbol:
             return
         self._stamp_liq_candle()
         self._liq_full = book
         self._liq_clips = dict(payload.get("clips") or {})
         self._liq_targets = dict(payload.get("targets") or {})
+        if self._background:
+            self._release_held_signal()
+            return
         self._clip_gen += 1
         self._apply_liq_span()
 
@@ -7610,10 +7873,13 @@ class MainWindow(QMainWindow):
         self._launch(worker, "_clip_worker")
 
     def _on_clips(self, generation: int, payload: dict) -> None:
-        if self._background or generation != self._clip_gen or payload.get("book") is not self._liq_full:
+        if generation != self._clip_gen or payload.get("book") is not self._liq_full:
             return
         self._liq_clips.update(payload.get("clips") or {})
         self._liq_targets.update(payload.get("targets") or {})
+        if self._background:
+            self._release_held_signal()
+            return
         self._apply_liq_span()
 
     def _targets_ready(self) -> bool:
@@ -7788,7 +8054,10 @@ class MainWindow(QMainWindow):
                 detail = f"{format_price(float(target))} · {tp_text}{sl_text}"
             else:
                 detail = "Hedef yok"
-            signal_rows.append((label, "—" if quiet else verdict, tone, f"{clock}  {detail} · {_score_line(coin, label)}".strip()))
+            score_text = _score_line(coin, label)
+            if verdict in TREND_SCORE:
+                score_text = f"{score_text} · {verdict} {_score_line(coin, verdict)}"
+            signal_rows.append((label, "—" if quiet else verdict, tone, f"{clock}  {detail} · {score_text}".strip()))
         live = getattr(self, "_okx_live", None) or []
         position_rows: list[tuple[str, str, str, str, str]] = []
         for position in live:
@@ -7878,14 +8147,115 @@ class MainWindow(QMainWindow):
         self._ensure_regime()
         self._start_snapshot(force=True)
 
+    def _auto_symbols(self) -> set[str]:
+        """Açık otomatik işlemi olan coinler. Elle açılanlar fiyata bağlanmaz."""
+        data = _read_state()
+        positions = data.get("okx_positions")
+        found: set[str] = set()
+        if not isinstance(positions, dict):
+            return found
+        for symbol, coin in positions.items():
+            if not isinstance(coin, dict):
+                continue
+            if any(isinstance(row, dict) and not row.get("manual") for row in coin.values()):
+                found.add(str(symbol))
+        return found
+
     def _feed_symbols(self) -> list[str]:
         symbols = {symbol for symbol, levels in self._alarms.items() if levels}
+        symbols.update(self._auto_symbols())
         if not self._background and not is_index(self._symbol):
             symbols.add(self._symbol)
         return sorted(symbols)
 
     def _sync_feed(self) -> None:
         self._feed.follow(self._feed_symbols())
+
+    def _watch_stop(self, symbol: str, price: float) -> None:
+        """Gelen fiyat kayıtlı stopu delerse sinyali o anda kapatır ve bildirir."""
+        if not isinstance(price, (int, float)) or float(price) <= 0:
+            return
+        data = _read_state()
+        positions = data.get("okx_positions")
+        coin = positions.get(symbol) if isinstance(positions, dict) else None
+        if not isinstance(coin, dict):
+            return
+        stored = data.get("signal_open")
+        book = dict(stored) if isinstance(stored, dict) else {}
+        episodes = dict(book.get(symbol) or {}) if isinstance(book.get(symbol), dict) else {}
+        events: list[_SignalEvent] = []
+        notes: list[tuple] = []
+        closes: list[dict] = []
+        for label, row in list(coin.items()):
+            if not isinstance(row, dict) or row.get("manual"):
+                continue
+            episode = episodes.get(label)
+            if not isinstance(episode, dict) or not episode.get("verdict"):
+                continue
+            side = episode.get("side") or row.get("side")
+            sl = episode.get("sl") if isinstance(episode.get("sl"), (int, float)) else row.get("sl")
+            entry = episode.get("entry")
+            if not _stop_reached(side, sl, entry, float(price), float(price)):
+                continue
+            closed = episode.get("candle")
+            closed_ms = int(closed) if isinstance(closed, (int, float)) else 0
+            rest, event, note = _stopped_episode(label, episode, closed_ms)
+            episodes[label] = rest
+            events.append(event)
+            if note:
+                notes.append(note)
+            closes.append({"op": "close", "label": label, "held": dict(row)})
+        if not events:
+            return
+        manual = any(isinstance(row, dict) and row.get("manual") for row in coin.values())
+        book[symbol] = episodes
+        patch = {"signal_open": book}
+        if notes:
+            patch["signal_score"] = _bump_score(data.get("signal_score"), symbol, notes)
+        _patch_state(**patch)
+        try:
+            self._paint_active()
+        except Exception:
+            pass
+        token = str(data.get("telegram_token") or "").strip()
+        chat_id = str(data.get("telegram_chat_id") or "").strip()
+        if token and chat_id:
+            lines = [f"{symbol} · {event.label}\n{event.verdict} kapandı · stop" for event in events]
+            self._queue_telegram(token, chat_id, "\n\n".join(lines))
+        if manual:
+            _okx_note(symbol, "", "close", False, "emir gitmedi: elle pozisyon duruyor")
+            self._show_okx_log()
+            self._sync_feed()
+            return
+        settings = self._okx_settings()
+        if settings is None or not closes:
+            self._sync_feed()
+            return
+        owned = [
+            str(row.get("side"))
+            for row in coin.values()
+            if isinstance(row, dict) and not row.get("manual") and row.get("side") in ("up", "down")
+        ]
+        payload = {
+            "creds": settings["creds"],
+            "symbol": symbol,
+            "price": float(price),
+            "settings": {
+                "margin_pct": settings["margin_pct"],
+                "risk_pct": settings["risk_pct"],
+                "leverage": settings["leverage"],
+                "lever_cap": settings["lever_cap"],
+                "mgn_mode": settings["mgn_mode"],
+                "simulated": settings["simulated"],
+                "owned_sides": owned,
+            },
+            "actions": closes,
+        }
+        if self._thread_running("_okx_worker"):
+            self._okx_wait.append(payload)
+        else:
+            self._start_okx(payload)
+        self._sync_feed()
 
     def _build_tray(self) -> None:
         self._tray = QSystemTrayIcon(_tray_icon(), self)
@@ -7926,8 +8296,6 @@ class MainWindow(QMainWindow):
     def _release_tray_memory(self) -> None:
         """Görünen seriler ve birikmiş önbellekler bırakılır. Saatlik sinyal durmaz."""
         self._regime_gen += 1
-        self._liq_gen += 1
-        self._clip_gen += 1
         self._history_gen += 1
         self._index_gen += 1
         self._last_candles = []
@@ -7937,10 +8305,7 @@ class MainWindow(QMainWindow):
         self._index_quote_map = {}
         self._funding_shown = []
         self._funding_drawn = None
-        self._liq_full = None
-        self._liq_map = None
         self._liq_clips = {}
-        self._liq_targets = {}
         if hasattr(self, "price_chart"):
             self._draw_candles([])
         if hasattr(self, "table"):
@@ -7987,11 +8352,21 @@ class MainWindow(QMainWindow):
         self.close()
 
     def _on_tick(self) -> None:
+        due = _newly_due(int(time.time() * 1000), self._signal_seen)
+        if due:
+            self._signal_due = set(due)
+            self._start_snapshot(
+                force=False,
+                with_chart=not self._background,
+                tray=self._background,
+                decide=True,
+                panels=True,
+            )
+            return
         if self._background:
-            self._tray_signal()
             return
         self._start_list()
-        self._start_snapshot(force=False)
+        self._start_snapshot(force=False, panels=False)
 
     def _tray_signal(self) -> None:
         """Saat değişmediyse istek yok. Değişince saatlik ve üstü sinyal görüntüsü alınır."""
@@ -8095,7 +8470,7 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(message)
 
-    def _start_snapshot(self, force: bool, with_chart: bool = True, tray: bool = False) -> None:
+    def _start_snapshot(self, force: bool, with_chart: bool = True, tray: bool = False, decide: bool = False, panels: bool = True) -> None:
         if is_index(self._symbol):
             if not self._background:
                 self._start_index(force)
@@ -8110,9 +8485,11 @@ class MainWindow(QMainWindow):
         entry = stored.get(self._symbol) if isinstance(stored, dict) else None
         episodes = entry if isinstance(entry, dict) else {}
         enabled = set(self._windows_on)
-        if tray:
-            enabled &= set(SIGNAL_WINDOWS)
+        if tray or decide:
+            enabled &= set(self._signal_due or set(SIGNAL_WINDOWS))
         self._tray_snap_gen = generation if tray else None
+        if decide:
+            self._decide_gen = generation
         worker = SnapshotWorker(
             self._symbol,
             self._interval,
@@ -8120,6 +8497,7 @@ class MainWindow(QMainWindow):
             enabled=enabled,
             episodes=episodes,
             tray=tray,
+            panels=panels,
         )
         worker.done.connect(lambda payload, gen=generation: self._on_snapshot(gen, payload))
         worker.failed.connect(lambda message, gen=generation: self._on_snap_fail(gen, message))
@@ -8304,12 +8682,45 @@ class MainWindow(QMainWindow):
             return self._session_change
         return quote.change_pct
 
+    def _record_trend_long(self, snapshot: Snapshot) -> None:
+        tape = getattr(self, "_liq_tape", None)
+        if tape is None:
+            return
+        windows = {item.label: item for item in snapshot.windows}
+        reads = {item.label: item for item in snapshot.reads}
+        window = windows.get("1sa")
+        read = reads.get("1sa")
+        if window is None or read is None:
+            return
+        for builder in (trend_satiri, trend_short_satiri):
+            row = builder(
+                snapshot.symbol,
+                read.result,
+                window.closed_ms,
+                window.closed_close,
+                snapshot.funding_percent,
+                read.oi_state,
+                read.price_state,
+                window.cvd_spot,
+                window.cvd_perp,
+            )
+            if row is not None:
+                tape.note_trend_long(row)
+
     def _on_snapshot(self, generation: int, snapshot: Snapshot) -> None:
         if generation != self._snap_gen or snapshot.symbol != self._symbol:
             return
+        self._record_trend_long(snapshot)
+        if generation == self._decide_gen:
+            self._finish_due(snapshot)
         if self._background or generation == self._tray_snap_gen:
-            if self._background:
-                self._maybe_telegram(snapshot)
+            return
+        if generation != self._decide_gen and not snapshot.windows:
+            self.header_price.setText(format_price(snapshot.price))
+            fresh = list(snapshot.candles)[-CHART_BARS:]
+            if fresh:
+                self._last_candles = fresh
+                self._draw_candles(self._last_candles)
             return
         self.heading.setText(snapshot.base)
         self.header_price.setText(format_price(snapshot.price))
@@ -8349,7 +8760,6 @@ class MainWindow(QMainWindow):
         self._render_list(False)
         self._fill_windows(snapshot)
         self._live_15_anchor = next((item.anchor for item in snapshot.windows if item.label == "15dk"), None)
-        self._maybe_telegram(snapshot)
         fresh = list(snapshot.candles)[-CHART_BARS:]
         if fresh:
             self._recent_start_ms = fresh[0].time_ms
@@ -8380,12 +8790,42 @@ class MainWindow(QMainWindow):
         if self._page == "liq":
             self._load_liq_candles()
 
+    def _yakin_stop_sonucu(self, label: str, verdict: str, price) -> str:
+        """Yakın stop zaman analizinde İşlem Açma görünür. Emir bu yüzden de açılmaz."""
+        if verdict in QUIET_VERDICTS or verdict in ("—", ""):
+            return verdict
+        side = _trade_side(verdict)
+        hours = ANALYSIS_HOURS.get(label)
+        if side is None or hours is None or not isinstance(price, (int, float)) or float(price) <= 0:
+            return verdict
+        sl = self._stop_level(verdict, hours, float(price))
+        if _stop_cok_yakin(float(price), sl):
+            return "İşlem Açma"
+        return verdict
+
     def _fill_windows(self, snapshot: Snapshot) -> None:
-        self.analysis.setRowCount(len(snapshot.windows))
         reads = {item.label: item for item in snapshot.reads}
+        existing = [
+            self.analysis.item(row, 0).text()
+            for row in range(self.analysis.rowCount())
+            if self.analysis.item(row, 0) is not None
+        ]
+        incoming = [window.label for window in snapshot.windows]
+        if existing and set(incoming) < set(existing):
+            slots = {label: row for row, label in enumerate(existing)}
+            for window in snapshot.windows:
+                index = slots.get(window.label)
+                if index is None:
+                    continue
+                self._paint_window_row(index, window, reads.get(window.label), snapshot.price)
+            return
+        self.analysis.setRowCount(len(snapshot.windows))
         for index, window in enumerate(snapshot.windows):
-            read = reads.get(window.label)
+            self._paint_window_row(index, window, reads.get(window.label), snapshot.price)
+
+    def _paint_window_row(self, index: int, window, read, price) -> None:
             verdict = read.trap or read.result if read is not None else "—"
+            verdict = self._yakin_stop_sonucu(window.label, verdict, price)
             cells = [
                 (window.label, None, False, FLAT),
                 (format_percent(window.price_pct), window.price_pct, True, None),
@@ -8738,22 +9178,86 @@ class MainWindow(QMainWindow):
         if snapshot is None or snapshot.symbol != self._symbol:
             return
         self._held_signal = None
-        self._maybe_telegram(snapshot, fresh=True)
+        labels = getattr(self, "_held_labels", None)
+        self._maybe_telegram(snapshot, fresh=True, only=labels)
+        if not self._background and snapshot.windows:
+            self._fill_windows(snapshot)
 
     def _release_held_signal(self) -> None:
         snapshot = getattr(self, "_held_signal", None)
         if snapshot is None or snapshot.symbol != self._symbol:
             return
         self._held_signal = None
-        self._maybe_telegram(snapshot, fresh=True)
+        labels = getattr(self, "_held_labels", None)
+        self._maybe_telegram(snapshot, fresh=True, only=labels)
+        if not self._background and snapshot.windows:
+            self._fill_windows(snapshot)
 
-    def _maybe_telegram(self, snapshot: Snapshot, fresh: bool = False) -> None:
+    def _finish_due(self, snapshot: Snapshot) -> None:
+        """Kapanmış mum hazırsa sinyali işle. Değilse bir kez daha dene."""
+        now = int(time.time() * 1000)
+        windows = {item.label: item for item in snapshot.windows}
+        ready: set[str] = set()
+        pending: set[str] = set()
+        for label in list(self._signal_due):
+            window = windows.get(label)
+            closed = None if window is None else window.closed_ms
+            if _closed_candle_ready(closed, now, SIGNAL_BAR_MS[label], label):
+                ready.add(label)
+            else:
+                pending.add(label)
+        if pending and not self._signal_retried:
+            self._signal_retried = True
+            QTimer.singleShot(5000, self._retry_due)
+        elif pending:
+            for label in pending:
+                self._signal_seen[label] = _signal_mark(now, label)
+            self._signal_retried = False
+            pending = set()
+        for label in ready:
+            self._signal_seen[label] = _signal_mark(now, label)
+        self._signal_due = set(pending)
+        if not ready:
+            return
+        self._held_labels = set(ready)
+        self._maybe_telegram(snapshot, only=ready)
+        if self._held_signal is None:
+            self._signal_due = set(pending)
+
+    def _retry_due(self) -> None:
+        if not self._signal_due:
+            return
+        self._start_snapshot(
+            force=False,
+            with_chart=not self._background,
+            tray=self._background,
+            decide=True,
+            panels=True,
+        )
+
+    def _drop_signal_maps(self) -> None:
+        """Emir turu bitince harita silinir. Likidite sayfası açıksa ekrandaki harita durur."""
+        if self._signal_due:
+            return
+        if not self._background and getattr(self, "_page", "") == "liq":
+            return
+        self._liq_targets = {}
+        self._liq_clips = {}
+        self._liq_full = None
+        self._liq_map = None
+        self._signal_hours = set()
+
+    def _maybe_telegram(self, snapshot: Snapshot, fresh: bool = False, only: set[str] | None = None) -> None:
         data = _read_state()
         reads = {item.label: item for item in snapshot.reads}
         windows = {item.label: item for item in snapshot.windows}
+        due = set(self._signal_due if only is None else only)
+        if not due:
+            return
         verdicts: dict[str, str] = {}
-        map_ready = self._targets_ready()
         for label in SIGNAL_WINDOWS:
+            if due and label not in due:
+                continue
             read = reads.get(label)
             if read is None:
                 continue
@@ -8766,36 +9270,22 @@ class MainWindow(QMainWindow):
             candles[label] = (window.closed_ms, window.closed_high, window.closed_low)
         stored = data.get("signal_open")
         book = dict(stored) if isinstance(stored, dict) else {}
-        if not fresh:
-            open_book = book.get(snapshot.symbol) if isinstance(book.get(snapshot.symbol), dict) else {}
-            trial_targets = {
-                label: self._liquidity_target(verdict, SIGNAL_LIQ_HOURS[label], self._aim_price(open_book, label, verdict, snapshot.price))
-                for label, verdict in verdicts.items()
-                if label in SIGNAL_LIQ_HOURS
-            }
-            _trial, trial_events, _trial_notes = _advance_signal(
-                dict(book),
-                snapshot.symbol,
-                candles,
-                dict(verdicts),
-                trial_targets,
-                snapshot.price,
-                snapshot.touches if isinstance(snapshot.touches, dict) else {},
-            )
-            defer = {event.label for event in trial_events if event.kind in ("yeni", "hedef")}
-            if defer:
-                running = self._thread_running("_liq_worker")
-                if not running:
-                    self._ensure_liquidity(True)
-                if running or self._thread_running("_liq_worker"):
-                    self._held_signal = snapshot
-                    if map_ready:
-                        for label in defer:
-                            verdicts.pop(label, None)
-        if not fresh and not map_ready:
-            for label, verdict in list(verdicts.items()):
-                if _trade_side(verdict):
-                    verdicts.pop(label, None)
+        ladder = (24, 72, 168, 720)
+        needed: set[int] = set()
+        for label, verdict in verdicts.items():
+            if label not in SIGNAL_LIQ_HOURS or not _trade_side(verdict):
+                continue
+            hours = SIGNAL_LIQ_HOURS[label]
+            if hours in ladder:
+                needed.update(ladder[ladder.index(hours):])
+            else:
+                needed.add(hours)
+        missing = [hours for hours in needed if (hours, self._liq_conserved) not in self._liq_targets]
+        if missing and not fresh:
+            self._held_signal = snapshot
+            self._signal_hours = set(missing)
+            self._ensure_liquidity(True)
+            return
         previous = book.get(snapshot.symbol) if isinstance(book.get(snapshot.symbol), dict) else {}
         targets = {
             label: self._liquidity_target(verdict, SIGNAL_LIQ_HOURS[label], self._aim_price(previous, label, verdict, snapshot.price))
@@ -8843,7 +9333,7 @@ class MainWindow(QMainWindow):
             for item in self._signal_marks
         }
         for event in events:
-            if event.kind in ("kapandi", "sure", "yeni"):
+            if event.kind in ("kapandi", "sure", "stop", "yeni"):
                 old = previous.get(event.label) if isinstance(previous, dict) else None
                 if event.kind != "yeni" or (isinstance(old, dict) and old.get("verdict")):
                     if _close_mark(self._signal_marks, snapshot.symbol, event.label, old):
@@ -8903,6 +9393,8 @@ class MainWindow(QMainWindow):
                 paint()
             except Exception:
                 pass
+        self._drop_signal_maps()
+        self._sync_feed()
 
     def _okx_settings(self) -> dict | None:
         data = _read_state()
@@ -8941,7 +9433,11 @@ class MainWindow(QMainWindow):
         }
 
     def _queue_okx(self, snapshot: Snapshot, events: list[_SignalEvent], current: dict) -> None:
-        events = [event for event in events if event.kind in ("yeni", "kapandi", "sure", "hedef")]
+        events = [
+            event
+            for event in events
+            if event.kind in ("yeni", "kapandi", "sure", "stop", "hedef")
+        ]
         if not events:
             return
         settings = self._okx_settings()
@@ -8968,74 +9464,32 @@ class MainWindow(QMainWindow):
         if not isinstance(coin, dict):
             coin = {}
         price = float(snapshot.price) if isinstance(snapshot.price, (int, float)) and snapshot.price > 0 else 0.0
-        actions: list[dict] = []
-        for event in events:
-            if event.label not in settings["windows"]:
-                continue
-            if event.kind in ("kapandi", "sure"):
-                held = coin.get(event.label)
-                if isinstance(held, dict):
-                    actions.append({"op": "close", "label": event.label, "held": dict(held)})
-                continue
-            if event.kind == "hedef":
-                episode = current.get(event.label) if isinstance(current.get(event.label), dict) else {}
-                held = coin.get(event.label)
-                if not isinstance(held, dict) or held.get("manual"):
-                    continue
-                new_tp = episode.get("tp")
-                old_tp = held.get("tp")
-                if not isinstance(new_tp, (int, float)) or float(new_tp) <= 0:
-                    continue
-                if isinstance(old_tp, (int, float)) and _same_price(float(old_tp), float(new_tp)):
-                    continue
-                actions.append(
-                    {
-                        "op": "amend",
-                        "label": event.label,
-                        "held": dict(held),
-                        "tp": float(new_tp),
-                        "side": episode.get("side"),
-                        "price": price,
-                    }
-                )
-                continue
-            if event.kind != "yeni":
+        chosen = [
+            event
+            for event in events
+            if event.label in settings["windows"]
+            and (event.kind != "yeni" or _order_signal(event.verdict) in settings["signals"])
+        ]
+        trap_limits: dict[str, tuple[float, float] | None] = {}
+        for event in chosen:
+            if event.kind != "yeni" or _order_signal(event.verdict) not in ("Long Trap", "Short Trap"):
                 continue
             episode = current.get(event.label) if isinstance(current.get(event.label), dict) else {}
-            held = coin.get(event.label)
-            if isinstance(held, dict):
-                actions.append({"op": "close", "label": event.label, "held": dict(held)})
-            family = _order_signal(event.verdict)
-            if family not in settings["signals"]:
-                continue
-            tp = episode.get("tp")
             entry = episode.get("entry")
             spot = float(entry) if isinstance(entry, (int, float)) and float(entry) > 0 else price
-            sl = episode.get("sl")
-            if not _sl_beyond(episode.get("side"), sl, spot):
-                _okx_note(snapshot.symbol, event.label, "open", False, "emir gitmedi: stop kümesi yok")
-                self._show_okx_log()
-                continue
-            action = {
-                "op": "open",
-                "label": event.label,
-                "side": episode.get("side"),
-                "tp": tp,
-                "sl": float(sl),
-                "price": spot,
-            }
-            if family in ("Long Trap", "Short Trap") and spot > 0:
-                hours = SIGNAL_LIQ_HOURS.get(event.label)
-                level = self._trap_bucket(event.verdict, hours, spot) if isinstance(hours, int) else None
-                if level is not None:
-                    limits = _trap_limits(episode.get("side"), spot, float(level))
-                    if limits is None:
-                        _okx_note(snapshot.symbol, event.label, "open", False, "emir gitmedi: ters likidite girişe çok yakın")
-                        self._show_okx_log()
-                        continue
-                    action["op"] = "scale"
-                    action["limits"] = [limits[0], limits[1]]
-            actions.append(action)
+            hours = SIGNAL_LIQ_HOURS.get(event.label)
+            level = self._trap_bucket(event.verdict, hours, spot) if isinstance(hours, int) and spot > 0 else None
+            trap_limits[event.label] = _trap_limits(episode.get("side"), spot, float(level)) if level is not None else None
+        actions, notes = _plan_orders(chosen, coin, current, trap_limits)
+        for note in notes:
+            _okx_note(snapshot.symbol, "", "open", False, note)
+        if notes:
+            self._show_okx_log()
+        owned = [
+            str(row.get("side"))
+            for row in coin.values()
+            if isinstance(row, dict) and not row.get("manual") and row.get("side") in ("up", "down")
+        ]
         if not actions:
             return
         payload = {
@@ -9049,6 +9503,7 @@ class MainWindow(QMainWindow):
                 "lever_cap": settings["lever_cap"],
                 "mgn_mode": settings["mgn_mode"],
                 "simulated": settings["simulated"],
+                "owned_sides": owned,
             },
             "actions": actions,
         }
@@ -9086,7 +9541,7 @@ class MainWindow(QMainWindow):
                 coin.pop(label, None)
             elif row.get("op") == "open" and row.get("ok") and isinstance(row.get("position"), dict) and label:
                 coin[label] = row["position"]
-            elif row.get("op") == "amend" and row.get("ok") and isinstance(row.get("position"), dict) and label:
+            elif row.get("op") in ("amend", "guard", "drop") and row.get("ok") and isinstance(row.get("position"), dict) and label:
                 coin[label] = row["position"]
             if symbol:
                 if coin:
@@ -9110,6 +9565,7 @@ class MainWindow(QMainWindow):
         if lines:
             self.statusBar().showMessage(" · ".join(lines))
         self._show_okx_log()
+        self._sync_feed()
         if self._okx_wait:
             self._start_okx(self._okx_wait.pop(0))
 
@@ -9734,6 +10190,8 @@ class MainWindow(QMainWindow):
     def _on_trades(self, symbol: str, path: list) -> None:
         for price in path:
             self._check_alarms(symbol, price)
+        if path:
+            self._watch_stop(symbol, path[-1])
         if self._background or symbol != self._symbol or not path:
             return
         self._live_price = path[-1]
@@ -10158,9 +10616,9 @@ def _oi_unit(high: float) -> tuple[float, str]:
 def _verdict_color(text: str) -> QColor:
     if "Trap" in text:
         return AMBER
-    if text in {"Sağlıklı Long", "Short Squeeze", "Akümülasyon"}:
+    if text in {"Sağlıklı Long", "Short Squeeze", "Akümülasyon", "Trend Long"}:
         return UP
-    if text in {"Sağlıklı Short", "Long Squeeze", "Dağıtım"}:
+    if text in {"Sağlıklı Short", "Long Squeeze", "Dağıtım", "Trend Short"}:
         return DOWN
     return MUTED
 

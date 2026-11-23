@@ -75,6 +75,7 @@ class Window:
     closed_ms: int | None = None
     closed_high: float | None = None
     closed_low: float | None = None
+    closed_close: float | None = None
     anchor: float | None = None
 
 
@@ -704,9 +705,46 @@ def _one_window(
         closed_ms=None if last is None else last.time_ms,
         closed_high=None if last is None else last.high,
         closed_low=None if last is None else last.low,
+        closed_close=None if last is None else last.close,
         anchor=None if previous is None or not keep_open else previous.close,
     )
     return window, (closed, aligned, cvd_spot, cvd_perp)
+
+
+def _chart_only(symbol: str, chart_interval: str) -> Snapshot:
+    """Açık pencerede dakikalık akış yalnız grafiği yeniler. Sinyal paketi burada çekilmez."""
+    chart: list[Bar] = []
+    try:
+        chart = list(cached_klines(symbol, "15m", True, CHART_BARS, True))[-CHART_BARS:]
+    except MarketError:
+        chart = []
+    mark = None
+    try:
+        live = _live(symbol)
+        mark = live[0] if live else None
+    except MarketError:
+        mark = None
+    price = chart[-1].close if chart else mark
+    return Snapshot(
+        symbol=symbol,
+        base=base_of(symbol),
+        interval=chart_interval if chart_interval == "15m" else "15m",
+        price=price,
+        oi_base=None,
+        oi_usd=None,
+        funding_percent=None,
+        next_funding_ms=None,
+        cvd_spot_day=None,
+        cvd_perp_day=None,
+        candles=chart,
+        oi_points=[],
+        windows=[],
+        funding_status="",
+        reads=[],
+        funding_hourly=[],
+        warning=None,
+        session_change=_session_price_pct(chart),
+    )
 
 
 def load_snapshot(
@@ -715,10 +753,13 @@ def load_snapshot(
     with_chart: bool = True,
     enabled: set[str] | None = None,
     tray: bool = False,
+    panels: bool = True,
 ) -> Snapshot:
     symbol = symbol.upper().strip()
     if chart_interval not in CHART_INTERVALS:
         raise MarketError(f"Bilinmeyen grafik aralığı: {chart_interval}")
+    if not panels:
+        return _chart_only(symbol, chart_interval)
 
     warning = None
     wanted = [row for row in ANALYSIS if row[0] != "15dk" and (enabled is None or row[0] in enabled)]
