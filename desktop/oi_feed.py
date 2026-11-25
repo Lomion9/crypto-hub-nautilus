@@ -8,18 +8,16 @@ birleşik seri döner; toplama sıfır yazılmaz.
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
-import requests
-
 from desktop.market import HOUR_MS, Point
+from desktop.net import cache_path
+from desktop.net import get_json as _get
+from desktop.net import post_json
 
-HEADERS = {"User-Agent": "CryptoHub-Desktop"}
-TIMEOUT = 12
 BAR_MS = {"15m": 15 * 60 * 1000, "1h": HOUR_MS, "2h": 2 * HOUR_MS, "4h": 4 * HOUR_MS, "1d": 24 * HOUR_MS}
 WANT = {"15m": 200, "1h": 48, "2h": 40, "4h": 40, "1d": 40}
 PERIODS = ("15m", "1h", "2h", "4h", "1d")
@@ -467,13 +465,6 @@ def _sample_points(name: str, coin: str, bar_ms: int) -> list[Point]:
     return [Point(stamp, buckets[stamp]) for stamp in sorted(buckets)]
 
 
-def _sample_path() -> str:
-    root = os.environ.get("APPDATA") or os.path.expanduser("~")
-    folder = os.path.join(root, "CryptoHub")
-    os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, "oi_live.json")
-
-
 def _load_samples() -> None:
     global _SAMPLES_LOADED
     with _LOCK:
@@ -481,7 +472,7 @@ def _load_samples() -> None:
             return
         _SAMPLES_LOADED = True
         try:
-            with open(_sample_path(), encoding="utf-8") as handle:
+            with open(cache_path("oi_live.json"), encoding="utf-8") as handle:
                 raw = json.load(handle)
         except (OSError, json.JSONDecodeError):
             return
@@ -499,7 +490,7 @@ def _save_samples() -> bool:
         payload = {key: rows for key, rows in _SAMPLES.items()}
         _SAMPLES_DIRTY = False
     try:
-        with open(_sample_path(), "w", encoding="utf-8") as handle:
+        with open(cache_path("oi_live.json"), "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
     except OSError:
         return False
@@ -518,17 +509,6 @@ def release_memory() -> None:
         if saved:
             _SAMPLES.clear()
             _SAMPLES_LOADED = False
-
-
-def _get(url: str, params: dict | None = None):
-    try:
-        response = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
-    except requests.RequestException:
-        return None
-    try:
-        return response.json()
-    except ValueError:
-        return None
 
 
 def _rows(points: list[tuple[int, float]], limit: int) -> list[Point]:
@@ -760,38 +740,6 @@ def _htx(host: str, code: str, period: str, limit: int) -> tuple[str, list[Point
     return "ok", _rows(points, limit)
 
 
-def _hist_binance_usdt(coin: str, period: str, limit: int) -> tuple[str, list[Point]]:
-    return _binance_linear(coin, "USDT", period, limit)
-
-
-def _hist_binance_usdc(coin: str, period: str, limit: int) -> tuple[str, list[Point]]:
-    return _binance_linear(coin, "USDC", period, limit)
-
-
-def _hist_binance_usd(coin: str, period: str, limit: int) -> tuple[str, list[Point]]:
-    return _binance_inverse(coin, period, limit)
-
-
-def _hist_bybit_usdt(coin: str, period: str, limit: int) -> tuple[str, list[Point]]:
-    return _bybit(coin, "linear", f"{coin}USDT", period, limit, False)
-
-
-def _hist_bybit_usdc(coin: str, period: str, limit: int) -> tuple[str, list[Point]]:
-    return _bybit(coin, "linear", f"{coin}PERP", period, limit, False)
-
-
-def _hist_bybit_usd(coin: str, period: str, limit: int) -> tuple[str, list[Point]]:
-    return _bybit(coin, "inverse", f"{coin}USD", period, limit, True)
-
-
-def _hist_okx_usdt(coin: str, period: str, limit: int) -> tuple[str, list[Point]]:
-    return _okx(f"{coin}-USDT-SWAP", period, limit)
-
-
-def _hist_okx_usd(coin: str, period: str, limit: int) -> tuple[str, list[Point]]:
-    return _okx(f"{coin}-USD-SWAP", period, limit)
-
-
 def _bitfinex_key(coin: str) -> str:
     return f"t{coin}F0:USTF0"
 
@@ -842,25 +790,19 @@ def _hist_bitfinex(coin: str, period: str, limit: int) -> tuple[str, list[Point]
     return "ok", _rows(list(buckets.items()), limit)
 
 
-def _hist_htx_usdt(coin: str, period: str, limit: int) -> tuple[str, list[Point]]:
-    return _htx("https://api.hbdm.com/linear-swap-api/v1/swap_his_open_interest", f"{coin}-USDT", period, limit)
-
-
-def _hist_htx_usd(coin: str, period: str, limit: int) -> tuple[str, list[Point]]:
-    return _htx("https://api.hbdm.com/swap-api/v1/swap_his_open_interest", f"{coin}-USD", period, limit)
-
+_HTX_HIST = "https://api.hbdm.com/{}/v1/swap_his_open_interest"
 
 _HISTORY = {
-    "binance-usdt": _hist_binance_usdt,
-    "binance-usdc": _hist_binance_usdc,
-    "binance-usd": _hist_binance_usd,
-    "bybit-usdt": _hist_bybit_usdt,
-    "bybit-usdc": _hist_bybit_usdc,
-    "bybit-usd": _hist_bybit_usd,
-    "okx-usdt": _hist_okx_usdt,
-    "okx-usd": _hist_okx_usd,
-    "htx-usdt": _hist_htx_usdt,
-    "htx-usd": _hist_htx_usd,
+    "binance-usdt": lambda coin, period, limit: _binance_linear(coin, "USDT", period, limit),
+    "binance-usdc": lambda coin, period, limit: _binance_linear(coin, "USDC", period, limit),
+    "binance-usd": _binance_inverse,
+    "bybit-usdt": lambda coin, period, limit: _bybit(coin, "linear", f"{coin}USDT", period, limit, False),
+    "bybit-usdc": lambda coin, period, limit: _bybit(coin, "linear", f"{coin}PERP", period, limit, False),
+    "bybit-usd": lambda coin, period, limit: _bybit(coin, "inverse", f"{coin}USD", period, limit, True),
+    "okx-usdt": lambda coin, period, limit: _okx(f"{coin}-USDT-SWAP", period, limit),
+    "okx-usd": lambda coin, period, limit: _okx(f"{coin}-USD-SWAP", period, limit),
+    "htx-usdt": lambda coin, period, limit: _htx(_HTX_HIST.format("linear-swap-api"), f"{coin}-USDT", period, limit),
+    "htx-usd": lambda coin, period, limit: _htx(_HTX_HIST.format("swap-api"), f"{coin}-USD", period, limit),
     "bitfinex-usdt": _hist_bitfinex,
 }
 
@@ -890,14 +832,6 @@ def _live_binance_linear(coin: str, quote: str) -> tuple[str, float | None]:
         return "ok", float(payload["openInterest"])
     except (TypeError, ValueError, KeyError):
         return "down", None
-
-
-def _live_binance_usdt(coin: str) -> tuple[str, float | None]:
-    return _live_binance_linear(coin, "USDT")
-
-
-def _live_binance_usdc(coin: str) -> tuple[str, float | None]:
-    return _live_binance_linear(coin, "USDC")
 
 
 def _live_binance_usd(coin: str) -> tuple[str, float | None]:
@@ -936,18 +870,6 @@ def _live_bybit(category: str, symbol: str, inverse: bool) -> tuple[str, float |
     return ("ok", value) if value > 0 else ("down", None)
 
 
-def _live_bybit_usdt(coin: str) -> tuple[str, float | None]:
-    return _live_bybit("linear", f"{coin}USDT", False)
-
-
-def _live_bybit_usdc(coin: str) -> tuple[str, float | None]:
-    return _live_bybit("linear", f"{coin}PERP", False)
-
-
-def _live_bybit_usd(coin: str) -> tuple[str, float | None]:
-    return _live_bybit("inverse", f"{coin}USD", True)
-
-
 def _live_okx(inst: str) -> tuple[str, float | None]:
     payload = _get("https://www.okx.com/api/v5/public/open-interest", {"instType": "SWAP", "instId": inst})
     if not isinstance(payload, dict):
@@ -965,12 +887,10 @@ def _live_okx(inst: str) -> tuple[str, float | None]:
         return "down", None
 
 
-def _live_okx_usdt(coin: str) -> tuple[str, float | None]:
-    return _live_okx(f"{coin}-USDT-SWAP")
-
-
-def _live_okx_usd(coin: str) -> tuple[str, float | None]:
-    return _live_okx(f"{coin}-USD-SWAP")
+def _htx_missing(payload: dict) -> bool:
+    """HTX hata metni sözleşmenin olmadığını söylüyorsa doğrudur."""
+    message = str(payload.get("err_msg") or "").lower()
+    return "contract" in message or "exist" in message
 
 
 def _live_htx(url: str, code: str) -> tuple[str, float | None]:
@@ -978,10 +898,7 @@ def _live_htx(url: str, code: str) -> tuple[str, float | None]:
     if not isinstance(payload, dict):
         return "down", None
     if payload.get("status") != "ok":
-        message = str(payload.get("err_msg") or "").lower()
-        if "contract" in message or "exist" in message:
-            return "miss", None
-        return "down", None
+        return ("miss" if _htx_missing(payload) else "down"), None
     rows = payload.get("data") or []
     if not rows:
         return "down", None
@@ -989,14 +906,6 @@ def _live_htx(url: str, code: str) -> tuple[str, float | None]:
         return "ok", float(rows[0]["amount"])
     except (KeyError, TypeError, ValueError, IndexError):
         return "down", None
-
-
-def _live_htx_usdt(coin: str) -> tuple[str, float | None]:
-    return _live_htx("https://api.hbdm.com/linear-swap-api/v1/swap_open_interest", f"{coin}-USDT")
-
-
-def _live_htx_usd(coin: str) -> tuple[str, float | None]:
-    return _live_htx("https://api.hbdm.com/swap-api/v1/swap_open_interest", f"{coin}-USD")
 
 
 def _live_bitfinex(coin: str) -> tuple[str, float | None]:
@@ -1081,16 +990,7 @@ def _live_dydx(coin: str) -> tuple[str, float | None]:
 
 
 def _live_hyperliquid(coin: str) -> tuple[str, float | None]:
-    try:
-        response = requests.post(
-            "https://api.hyperliquid.xyz/info",
-            json={"type": "metaAndAssetCtxs"},
-            headers={**HEADERS, "Content-Type": "application/json"},
-            timeout=TIMEOUT,
-        )
-        payload = response.json()
-    except (requests.RequestException, ValueError):
-        return "down", None
+    payload = post_json("https://api.hyperliquid.xyz/info", {"type": "metaAndAssetCtxs"})
     if not isinstance(payload, list) or len(payload) < 2:
         return "down", None
     universe = (payload[0] or {}).get("universe") if isinstance(payload[0], dict) else None
@@ -1106,17 +1006,19 @@ def _live_hyperliquid(coin: str) -> tuple[str, float | None]:
     return "miss", None
 
 
+_HTX_LIVE = "https://api.hbdm.com/{}/v1/swap_open_interest"
+
 _LIVE = {
-    "binance-usdt": _live_binance_usdt,
-    "binance-usdc": _live_binance_usdc,
+    "binance-usdt": lambda coin: _live_binance_linear(coin, "USDT"),
+    "binance-usdc": lambda coin: _live_binance_linear(coin, "USDC"),
     "binance-usd": _live_binance_usd,
-    "bybit-usdt": _live_bybit_usdt,
-    "bybit-usdc": _live_bybit_usdc,
-    "bybit-usd": _live_bybit_usd,
-    "okx-usdt": _live_okx_usdt,
-    "okx-usd": _live_okx_usd,
-    "htx-usdt": _live_htx_usdt,
-    "htx-usd": _live_htx_usd,
+    "bybit-usdt": lambda coin: _live_bybit("linear", f"{coin}USDT", False),
+    "bybit-usdc": lambda coin: _live_bybit("linear", f"{coin}PERP", False),
+    "bybit-usd": lambda coin: _live_bybit("inverse", f"{coin}USD", True),
+    "okx-usdt": lambda coin: _live_okx(f"{coin}-USDT-SWAP"),
+    "okx-usd": lambda coin: _live_okx(f"{coin}-USD-SWAP"),
+    "htx-usdt": lambda coin: _live_htx(_HTX_LIVE.format("linear-swap-api"), f"{coin}-USDT"),
+    "htx-usd": lambda coin: _live_htx(_HTX_LIVE.format("swap-api"), f"{coin}-USD"),
     "bitfinex-usdt": _live_bitfinex,
     "woo-usdt": _live_woo,
     "deribit-usd": _live_deribit,

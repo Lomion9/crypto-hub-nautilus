@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from desktop.app import (
     SIGNAL_BAR_MS,
     _SignalEvent,
+    _chart_open_ms,
+    _closed_book,
     _closed_candle_ready,
     _newly_due,
     _plan_orders,
@@ -32,6 +34,10 @@ def test_saat_izgarasi():
     opened = datetime(2026, 11, 23, 14, 0, tzinfo=timezone.utc)
     hour = datetime(2026, 11, 23, 15, 0, 30, tzinfo=timezone.utc)
     assert "1sa" in _newly_due(_ms(hour), seen)
+    late = datetime(2026, 11, 25, 17, 17, tzinfo=timezone.utc)
+    assert _chart_open_ms(_ms(late), "15m") == _ms(datetime(2026, 11, 25, 17, 15, tzinfo=timezone.utc))
+    assert _chart_open_ms(_ms(late), "1h") == _ms(datetime(2026, 11, 25, 17, 0, tzinfo=timezone.utc))
+    assert _chart_open_ms(_ms(late), "1w") == _ms(datetime(2026, 11, 22, 0, 0, tzinfo=timezone.utc))
     assert _closed_candle_ready(_ms(opened), _ms(hour), SIGNAL_BAR_MS["1sa"], "1sa")
     assert not _closed_candle_ready(_ms(opened) - 3_600_000, _ms(hour), SIGNAL_BAR_MS["1sa"], "1sa")
     four = datetime(2026, 11, 23, 0, 0, 20, tzinfo=timezone.utc)
@@ -47,6 +53,17 @@ def test_saat_izgarasi():
     assert _signal_mark(_ms(thursday), "1hafta") == _signal_mark(_ms(thursday) - 120_000, "1hafta")
     previous_sunday = datetime(2026, 11, 15, 0, 0, tzinfo=timezone.utc)
     assert _closed_candle_ready(_ms(previous_sunday), _ms(sunday), SIGNAL_BAR_MS["1hafta"], "1hafta")
+
+
+def test_kapanan_elle_kayit_duser():
+    row = {"inst": "BTC-USDT-SWAP", "side": "down", "sz": "0.62", "manual": True}
+    assert _closed_book({"BTCUSDT": {"1sa": row}}, [], [], True) == {}
+    live = [{"inst": "BTC-USDT-SWAP", "symbol": "BTCUSDT", "side": "down"}]
+    assert _closed_book({"BTCUSDT": {"1sa": row}}, live, [], True)["BTCUSDT"]["1sa"]["manual"] is True
+    waiting = {"inst": "BTC-USDT-SWAP", "side": "down", "sz": "0", "limits": ["abc"]}
+    assert "1sa" in _closed_book({"BTCUSDT": {"1sa": waiting}}, [], [{"ord_id": "abc"}], True)["BTCUSDT"]
+    assert _closed_book({"BTCUSDT": {"1sa": waiting}}, [], [], True) == {}
+    assert "1sa" in _closed_book({"BTCUSDT": {"1sa": waiting}}, [], [], False)["BTCUSDT"]
 
 
 def test_elle_pozisyon():
@@ -115,6 +132,7 @@ def test_tuzak_sonrasi_kalan_kasa():
 
 if __name__ == "__main__":
     test_saat_izgarasi()
+    test_kapanan_elle_kayit_duser()
     test_elle_pozisyon()
     test_ayni_tuzak_susar()
     test_tuzak_uc_parca()

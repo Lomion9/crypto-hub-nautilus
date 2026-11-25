@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import bisect
 import gc
-import heapq
 import json
 import math
 import os
@@ -94,7 +93,6 @@ from desktop.indices import (
     release_memory as release_indices,
 )
 from desktop.liq_tape import DECISION_SYMBOL, LiquidationTape
-from desktop.trend_kayit import trend_satiri, trend_short_satiri
 from desktop.liquidity import LiquidityMap, clip_map, load_liquidity
 from desktop.okx_trade import (
     Creds,
@@ -190,10 +188,7 @@ ORDER_SIGNALS = (
     "Dağıtım",
     "Long Trap",
     "Short Trap",
-    "Trend Long",
-    "Trend Short",
 )
-_ONCEKI_SINYALLER = ORDER_SIGNALS[:-2]
 SIGNAL_MARK_BARS = 500
 SIGNAL_BAR_MS = {
     "1sa": 3_600_000,
@@ -223,6 +218,23 @@ def _newly_due(now_ms: int, seen: dict) -> list[str]:
     return [label for label in SIGNAL_WINDOWS if seen.get(label) != _signal_mark(now_ms, label)]
 
 
+_CHART_BAR_MS = {
+    "15m": 900_000,
+    "1h": 3_600_000,
+    "4h": 14_400_000,
+    "1d": 86_400_000,
+    "1w": 7 * 86_400_000,
+}
+
+
+def _chart_open_ms(now_ms: int, interval: str) -> int:
+    """İçinde bulunulan mumun açılışı. 1 hafta pazar 00:00 UTC."""
+    bar = _CHART_BAR_MS.get(interval, 900_000)
+    if interval == "1w":
+        return ((int(now_ms) - _WEEK_ALIGN_MS) // bar) * bar + _WEEK_ALIGN_MS
+    return (int(now_ms) // bar) * bar
+
+
 def _closed_candle_ready(closed_ms, now_ms: int, bar_ms: int, label: str = "") -> bool:
     """Kapanmış mum, az önce biten aralığın kendisiyse hazırdır."""
     if not isinstance(closed_ms, int) or bar_ms <= 0:
@@ -236,7 +248,6 @@ def _closed_candle_ready(closed_ms, now_ms: int, bar_ms: int, label: str = "") -
 CHART_SIGNAL = {"1h": "1sa", "4h": "4sa", "1d": "24sa", "1w": "1hafta"}
 SIGNAL_LIQ_HOURS = {"1sa": 24, "4sa": 72, "24sa": 168, "1hafta": 720}
 ANALYSIS_HOURS = {**SIGNAL_LIQ_HOURS, "15dk": 24, "2sa": 24, "8sa": 72}
-TREND_SCORE = {"Trend Long", "Trend Short"}
 SIGNAL_EXPIRE_MS = {"1sa": 24 * 60 * 60 * 1000, "4sa": 3 * 24 * 60 * 60 * 1000}
 SIGNAL_COOL_MS = {
     "1sa": 60 * 60 * 1000,
@@ -476,6 +487,13 @@ def _disk_state() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _symbol_entry(data, key: str, symbol: str) -> dict:
+    """Durumdaki data[key][symbol] sözlüğü. Eksik ya da bozuksa boş sözlük."""
+    book = data.get(key) if isinstance(data, dict) else None
+    entry = book.get(symbol) if isinstance(book, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
 def _lift_secrets(data: dict) -> dict:
     """Durum dosyasında kalan anahtarları şifreli dosyaya taşır."""
     moved = {key: data.pop(key) for key in _SECRET_KEYS if key in data}
@@ -638,7 +656,6 @@ _SHORT_MONTHS = (
 )
 _WEEKDAYS = ("Pzt", "Sal", "Çar", "Per", "Cum", "Cmt", "Paz")
 ALARM = QColor("#c084fc")
-TP_LINE = QColor("#facc15")
 
 
 def _cross_stamp(moment: datetime) -> str:
@@ -972,13 +989,6 @@ def _candle_follow(old_times: list[int], new_times: list[int]) -> str:
     return "rebuild"
 
 
-def _candle_holding(stamps: list[float], moment: float, step: int) -> float | None:
-    """Sinyal saatinin düştüğü mumun açılışı."""
-    if step <= 0 or not stamps:
-        return None
-    return _candle_holding_sorted(sorted(stamps), moment, step)
-
-
 def _candle_holding_sorted(stamps: list[float], moment: float, step: int) -> float | None:
     """Sıralı mum açılışları. Sağdaki, sinyal saatini hâlâ kapsayan mumdur."""
     if step <= 0 or not stamps:
@@ -1304,17 +1314,65 @@ def _chosen_windows(data: dict) -> set[str]:
     return set(SIGNAL_WINDOWS)
 
 
+def _drop_retired_signals() -> None:
+    """Kaldırılan Trend Long ve Trend Short kayıtlarını açık karttan ve skordan siler."""
+    retired = {"Trend Long", "Trend Short"}
+    data = _read_state()
+    patch: dict = {}
+    stored = data.get("signal_open")
+    if isinstance(stored, dict):
+        book = {}
+        touched = False
+        for symbol, coin in stored.items():
+            if not isinstance(coin, dict):
+                book[symbol] = coin
+                continue
+            rows = {}
+            for label, episode in coin.items():
+                if isinstance(episode, dict) and str(episode.get("verdict") or "") in retired:
+                    rows[label] = {
+                        "verdict": "",
+                        "quiet": True,
+                        "target": None,
+                        "side": None,
+                        "tp": None,
+                        "entry": None,
+                        "sl": None,
+                        "candle": episode.get("candle"),
+                    }
+                    touched = True
+                else:
+                    rows[label] = episode
+            book[symbol] = rows
+        if touched:
+            patch["signal_open"] = book
+    score = data.get("signal_score")
+    if isinstance(score, dict):
+        cleaned = {}
+        touched = False
+        for symbol, coin in score.items():
+            if not isinstance(coin, dict):
+                cleaned[symbol] = coin
+                continue
+            rows = {key: value for key, value in coin.items() if key not in retired}
+            touched = touched or len(rows) != len(coin)
+            cleaned[symbol] = rows
+        if touched:
+            patch["signal_score"] = cleaned
+    signals = data.get("okx_signals")
+    if isinstance(signals, list) and any(item in retired for item in signals):
+        patch["okx_signals"] = [item for item in signals if item not in retired]
+    if patch:
+        _patch_state(**patch)
+
+
 def _chosen_signals(data: dict) -> set[str]:
     """Kayıt yoksa bütün sinyal türleri. Boş liste hiçbiri demektir."""
     raw = data.get("okx_signals")
     if raw is None:
         return set(ORDER_SIGNALS)
     if isinstance(raw, list):
-        chosen = {str(item) for item in raw if str(item) in ORDER_SIGNALS}
-        saved = {str(item) for item in raw}
-        if set(_ONCEKI_SINYALLER) <= saved:
-            chosen.update(TREND_SCORE)
-        return chosen
+        return {str(item) for item in raw if str(item) in ORDER_SIGNALS}
     return set(ORDER_SIGNALS)
 
 
@@ -1347,6 +1405,18 @@ def _auto_leverage(data: dict) -> int:
         lever = int(raw or 0)
     except (TypeError, ValueError):
         return 5
+    return min(999, max(1, lever))
+
+
+def _min_leverage(data: dict) -> int:
+    """Otomatik emrin inebileceği en düşük kaldıraç. Kayıt yoksa 1."""
+    raw = data.get("okx_min_leverage")
+    if raw is None:
+        return 1
+    try:
+        lever = int(raw or 0)
+    except (TypeError, ValueError):
+        return 1
     return min(999, max(1, lever))
 
 
@@ -1841,9 +1911,41 @@ def _tray_icon() -> QIcon:
     return QIcon(pixmap)
 
 
-class SnapshotWorker(QThread):
+def _alive(owner, attr: str) -> bool:
+    """owner.attr iş parçacığı çalışıyorsa doğrudur. Silinmiş nesne alanı boşaltır."""
+    worker = getattr(owner, attr)
+    if worker is None:
+        return False
+    try:
+        return bool(worker.isRunning())
+    except RuntimeError:
+        setattr(owner, attr, None)
+        return False
+
+
+class _CallWorker(QThread):
+    """Arka planda tek iş. Bilinen hata kendi metniyle, diğerleri yedek metinle düşer."""
+
     done = Signal(object)
     failed = Signal(str)
+    errors: tuple[type[BaseException], ...] = (MarketError,)
+    fallback = "işlem başarısız"
+    show_error = True
+
+    def work(self):
+        raise NotImplementedError
+
+    def run(self) -> None:
+        try:
+            self.done.emit(self.work())
+        except self.errors as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit((str(exc) if self.show_error else "") or self.fallback)
+
+
+class SnapshotWorker(_CallWorker):
+    fallback = "güncelleme başarısız"
 
     def __init__(
         self,
@@ -1867,27 +1969,21 @@ class SnapshotWorker(QThread):
             for label, episode in (episodes or {}).items()
         }
 
-    def run(self) -> None:
-        try:
-            snapshot = load_snapshot(
-                self._symbol,
-                self._interval,
-                with_chart=self._with_chart,
-                enabled=self._enabled,
-                tray=self._tray,
-                panels=self._panels,
-            )
-            touches = {} if self._tray or not self._episodes else _episode_touch(self._symbol, self._episodes)
-            self.done.emit(replace(snapshot, touches=touches))
-        except MarketError as exc:
-            self.failed.emit(str(exc))
-        except Exception as exc:
-            self.failed.emit(str(exc) or "güncelleme başarısız")
+    def work(self):
+        snapshot = load_snapshot(
+            self._symbol,
+            self._interval,
+            with_chart=self._with_chart,
+            enabled=self._enabled,
+            tray=self._tray,
+            panels=self._panels,
+        )
+        touches = {} if self._tray or not self._episodes else _episode_touch(self._symbol, self._episodes)
+        return replace(snapshot, touches=touches)
 
 
-class HistoryWorker(QThread):
-    done = Signal(object)
-    failed = Signal(str)
+class HistoryWorker(_CallWorker):
+    fallback = "eski mumlar alınamadı"
 
     def __init__(self, symbol: str, interval: str, before_ms: int) -> None:
         super().__init__()
@@ -1895,26 +1991,15 @@ class HistoryWorker(QThread):
         self._interval = interval
         self._before_ms = before_ms
 
-    def run(self) -> None:
-        try:
-            self.done.emit(fetch_older_klines(self._symbol, self._interval, self._before_ms, CHART_PAGE))
-        except MarketError as exc:
-            self.failed.emit(str(exc))
-        except Exception as exc:
-            self.failed.emit(str(exc) or "eski mumlar alınamadı")
+    def work(self):
+        return fetch_older_klines(self._symbol, self._interval, self._before_ms, CHART_PAGE)
 
 
-class QuoteWorker(QThread):
-    done = Signal(object)
-    failed = Signal(str)
+class QuoteWorker(_CallWorker):
+    fallback = "liste alınamadı"
 
-    def run(self) -> None:
-        try:
-            self.done.emit(load_quotes())
-        except MarketError as exc:
-            self.failed.emit(str(exc))
-        except Exception as exc:
-            self.failed.emit(str(exc) or "liste alınamadı")
+    def work(self):
+        return load_quotes()
 
 
 class _IndexQuoteWorker(QThread):
@@ -1927,22 +2012,18 @@ class _IndexQuoteWorker(QThread):
             self.done.emit([])
 
 
-class _IndexChartWorker(QThread):
-    done = Signal(object)
-    failed = Signal(str)
+class _IndexChartWorker(_CallWorker):
+    errors = (IndexDataError,)
+    fallback = "Endeks alınamadı"
+    show_error = False
 
     def __init__(self, symbol: str, interval: str) -> None:
         super().__init__()
         self._symbol = symbol
         self._interval = interval
 
-    def run(self) -> None:
-        try:
-            self.done.emit(load_index_chart(self._symbol, self._interval))
-        except IndexDataError as exc:
-            self.failed.emit(str(exc))
-        except Exception:
-            self.failed.emit("Endeks alınamadı")
+    def work(self):
+        return load_index_chart(self._symbol, self._interval)
 
 
 class _TimeGuides(QGraphicsItem):
@@ -3486,22 +3567,6 @@ class ChartView(QChartView):
             new_end = home_end
         return float(new_start), float(new_end)
 
-    def _shift_x(self, cursor_x: float) -> None:
-        if self._drag_pan is None:
-            return
-        origin_x, start, end = self._drag_pan
-        span = end - start
-        plot = self.chart().plotArea()
-        width = plot.width()
-        if span <= 0 or width <= 0:
-            return
-        shift = (origin_x - cursor_x) / width * span
-        new_start, new_end = self._clamp_window(start + shift, end + shift)
-        home_start = self._home_x[0] if self._home_x is not None else new_start
-        self.pushed_older = shift < 0 and new_start <= home_start + 1000
-        _start, _end, datetime_axis = self._read_x()
-        self._write_x(new_start, new_end, datetime_axis)
-
     def _shift_xy(self, cursor_x: float, cursor_y: float) -> None:
         if self._drag_move is None:
             return
@@ -3875,21 +3940,6 @@ def _episode_text(snapshot: Snapshot, event: _SignalEvent, window) -> str:
     return "\n".join(lines)
 
 
-def _signal_text(snapshot: Snapshot, label: str, verdict: str, window) -> str:
-    price = format_percent(None if window is None else window.price_pct)
-    oi = format_percent(None if window is None else window.oi_pct)
-    perp = format_amount(None if window is None else window.cvd_perp)
-    spot = format_amount(None if window is None else window.cvd_spot)
-    funding = format_funding(snapshot.funding_percent)
-    return (
-        f"{snapshot.symbol} · {label}\n"
-        f"{verdict}\n"
-        f"Fiyat {price} · OI {oi}\n"
-        f"Funding {funding} · {snapshot.funding_status}\n"
-        f"CVD perp {perp} · CVD spot {spot}"
-    )
-
-
 class _QuietCombo(QComboBox):
     """Tekerlek sayfayı kaydırır, seçili değeri değiştirmez."""
 
@@ -3908,21 +3958,37 @@ class _IntervalCombo(_QuietCombo):
         edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
         edit.setFrame(False)
         self.setFixedSize(58, 28)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.setStyleSheet(
             "QComboBox { padding: 0 2px; font-size: 12px; }"
             "QComboBox QLineEdit { padding: 0; background: transparent; border: none; }"
         )
-        self.currentIndexChanged.connect(lambda _index: self.show_face())
+
+    def _show_item_text(self) -> None:
+        edit = self.lineEdit()
+        index = self.currentIndex()
+        if edit is None or index < 0:
+            return
+        edit.setText(self.itemText(index))
 
     def show_face(self) -> None:
         face = INTERVAL_FACE.get(str(self.currentData() or ""), "")
         edit = self.lineEdit()
-        if edit is not None and face and edit.text() != face:
+        if edit is None or not face or edit.text() == face:
+            return
+        index = self.currentIndex()
+        self.blockSignals(True)
+        edit.blockSignals(True)
+        edit.setText(face)
+        if index >= 0 and self.currentIndex() != index:
+            self.setCurrentIndex(index)
             edit.setText(face)
+        edit.blockSignals(False)
+        self.blockSignals(False)
 
     def showPopup(self) -> None:
+        self._show_item_text()
         super().showPopup()
-        self.show_face()
 
     def hidePopup(self) -> None:
         super().hidePopup()
@@ -4186,13 +4252,18 @@ class _SignalEvent:
         self.stop = stop
 
 
+def _fiyat_cok_yakin(price, level, ratio: float = STOP_MIN_RATIO) -> bool:
+    """Seviye, ürün fiyatının verilen oranından yakınsa doğrudur. Tam oran kabul edilir."""
+    if not isinstance(price, (int, float)) or not isinstance(level, (int, float)):
+        return False
+    if float(price) <= 0 or float(level) <= 0 or ratio <= 0:
+        return False
+    return abs(float(price) - float(level)) / float(price) < ratio
+
+
 def _stop_cok_yakin(price, sl) -> bool:
     """Stop, ürün fiyatının %0.5'inden yakınsa otomatik emir hiç açılmaz."""
-    if not isinstance(price, (int, float)) or not isinstance(sl, (int, float)):
-        return False
-    if float(price) <= 0 or float(sl) <= 0:
-        return False
-    return abs(float(price) - float(sl)) / float(price) < STOP_MIN_RATIO
+    return _fiyat_cok_yakin(price, sl)
 
 
 def _sl_beyond(side: str | None, level, price) -> bool:
@@ -4261,9 +4332,9 @@ def _signal_kind(verdict: str) -> str:
 
 def _trade_side(verdict: str) -> str | None:
     """Long Trap aşağı, Short Trap yukarı. Diğer long sonuçlar yukarı, short sonuçlar aşağı."""
-    if verdict == "Trend Long" or verdict.startswith("Short Trap") or verdict in {"Sağlıklı Long", "Short Squeeze", "Akümülasyon"}:
+    if verdict.startswith("Short Trap") or verdict in {"Sağlıklı Long", "Short Squeeze", "Akümülasyon"}:
         return "up"
-    if verdict == "Trend Short" or verdict.startswith("Long Trap") or verdict in {"Sağlıklı Short", "Long Squeeze", "Dağıtım"}:
+    if verdict.startswith("Long Trap") or verdict in {"Sağlıklı Short", "Long Squeeze", "Dağıtım"}:
         return "down"
     return None
 
@@ -4282,13 +4353,8 @@ def _trade_return(side, entry, exit_px) -> float | None:
 
 
 def _score_note(label: str, kind: str, episode, exit_px) -> tuple:
-    verdict = str(episode.get("verdict") or "") if isinstance(episode, dict) else ""
     side = episode.get("side") if isinstance(episode, dict) else None
     entry = episode.get("entry") if isinstance(episode, dict) else None
-    if verdict == "Trend Long":
-        return ("Trend Long", kind, _trade_return(side or "up", entry, exit_px))
-    if verdict == "Trend Short":
-        return ("Trend Short", kind, _trade_return(side or "down", entry, exit_px))
     return (label, kind, _trade_return(side, entry, exit_px))
 
 
@@ -4331,6 +4397,45 @@ def _trap_limits(side: str | None, price: float, level: float) -> tuple[float, f
     if side == "up" and not (inner < mid < price):
         return None
     return mid, inner
+
+
+def _closed_book(stored, live, orders, orders_known: bool = True) -> dict:
+    """Borsada kapanmış pozisyonun kaydını düşürür. Elle işareti kapanışı örtmez.
+
+    Pozisyon duruyorsa kayıt durur. Pozisyon yoksa yalnız hâlâ bekleyen limit
+    kaydı tutar. Emir listesi okunamadıysa limitli kayıt silinmez.
+    """
+    if not isinstance(stored, dict):
+        return {}
+    live_insts = {
+        str(row.get("inst"))
+        for row in live or []
+        if isinstance(row, dict) and row.get("inst")
+    }
+    open_ids = {
+        str(row.get("ord_id"))
+        for row in orders or []
+        if isinstance(row, dict) and row.get("ord_id")
+    }
+    kept: dict = {}
+    for symbol, coin in stored.items():
+        if not isinstance(coin, dict):
+            continue
+        rows = {}
+        for label, row in coin.items():
+            if not isinstance(row, dict):
+                continue
+            inst = str(row.get("inst") or "")
+            if not inst or inst in live_insts:
+                rows[label] = row
+                continue
+            limits = [str(item) for item in (row.get("limits") or []) if item]
+            if limits and (not orders_known or any(item in open_ids for item in limits)):
+                rows[label] = row
+                continue
+        if rows:
+            kept[str(symbol)] = rows
+    return kept
 
 
 def _position_alive(row: dict | None) -> bool:
@@ -4496,16 +4601,6 @@ def _cooling(episode: dict | None) -> bool:
     if not isinstance(until, (int, float)) or float(until) <= 0:
         return False
     return int(time.time() * 1000) < float(until)
-
-
-def _cool_ready(episode: dict | None, verdict: str) -> bool:
-    if _cooling(episode) or not isinstance(episode, dict):
-        return False
-    until = episode.get("cool_until")
-    waiting = str(episode.get("wait") or "")
-    if not isinstance(until, (int, float)) or float(until) <= 0 or not waiting:
-        return False
-    return verdict == waiting and verdict not in QUIET_VERDICTS
 
 
 def _cool_bypass(episode: dict | None, verdict: str) -> bool:
@@ -4764,12 +4859,7 @@ def _advance_signal(
         target = targets.get(label)
         new_side = _trade_side(verdict)
         old_side = episode.get("side") or _trade_side(str(episode.get("verdict") or ""))
-        if (
-            new_side
-            and new_side == old_side
-            and episode.get("verdict") not in TREND_SCORE
-            and verdict not in TREND_SCORE
-        ):
+        if new_side and new_side == old_side:
             kept = dict(episode)
             kept["verdict"] = verdict
             kept["quiet"] = False
@@ -4809,7 +4899,7 @@ def _bump_score(raw, symbol: str, notes: list[tuple]) -> dict:
         label = item[0]
         kind = item[1]
         pnl = item[2] if len(item) > 2 else None
-        if kind not in ("hit", "miss") or (label not in SIGNAL_WINDOWS and label not in TREND_SCORE):
+        if kind not in ("hit", "miss") or label not in SIGNAL_WINDOWS:
             continue
         row = dict(entry.get(label) or {})
         try:
@@ -5361,14 +5451,7 @@ class HeatMap(QWidget):
         job.start()
 
     def _heat_busy(self) -> bool:
-        job = self._heat_job
-        if job is None:
-            return False
-        try:
-            return bool(job.isRunning())
-        except RuntimeError:
-            self._heat_job = None
-            return False
+        return _alive(self, "_heat_job")
 
     def _on_heat_finished(self, job) -> None:
         if self._heat_job is job:
@@ -5469,12 +5552,6 @@ class HeatMap(QWidget):
 
     def _time_bounds(self) -> tuple[int, int] | None:
         return _heat_time_bounds(self._map, self._candles)
-
-    def _column_edges(self, index: int, width: int, start: int, end: int) -> tuple[int, int]:
-        book = self._map
-        if book is None:
-            return 0, 1
-        return _heat_column_edges(book, index, width, start, end)
 
     def _price_y(self, price: float) -> float:
         span = self._y_max - self._y_min
@@ -5686,104 +5763,83 @@ class HeatMap(QWidget):
         QToolTip.showText(event.globalPosition().toPoint(), text, self)
 
 
-TARGET_TOP = 4000
-
-
 class _TargetTable:
-    """Bir saat aralığının hedef adayları. En büyük kovalar, eski tarama sırasıyla."""
+    """Bir saat aralığının hedef adayları. Yalnız son saatte hâlâ duran kovalar, büyükten küçüğe."""
 
     def __init__(self, shown: LiquidityMap) -> None:
         self.symbol = shown.symbol
-        self.shown = shown
         self.window = None
-        self.top: list[tuple[float, float]] = []
-        self.complete = True
+        self.last_close = shown.closes[-1] if shown.closes else 0.0
+        self.entries: list[tuple[float, float]] = []
         if not shown.columns or shown.step <= 0:
             return
         self.window = _price_window(list(shown.lows or shown.closes), list(shown.highs or shown.closes), shown.step)
         if self.window is None:
             return
-        counter = [0]
-
-        def entries():
-            for level, usd in self._entries():
-                counter[0] += 1
-                yield level, usd
-
-        self.top = heapq.nlargest(TARGET_TOP, entries(), key=lambda entry: entry[1])
-        self.complete = counter[0] <= TARGET_TOP
-
-    def _entries(self):
-        shown = self.shown
         low, high = self.window
         step = shown.step
-        for offset, column in enumerate(shown.columns):
-            prices = shown.levels[offset] if offset < len(shown.levels) else {}
-            for index, usd in column.items():
-                if usd <= 0:
-                    continue
-                level = prices.get(index, (index + 0.5) * step)
-                if level < low or level > high:
-                    continue
-                yield level, usd
+        column = shown.columns[-1]
+        prices = shown.levels[-1] if len(shown.levels) == len(shown.columns) else {}
+        found: list[tuple[float, float]] = []
+        for index, usd in column.items():
+            if usd <= 0:
+                continue
+            level = prices.get(index, (index + 0.5) * step)
+            if low <= level <= high:
+                found.append((level, usd))
+        found.sort(key=lambda entry: entry[1], reverse=True)
+        self.entries = found
 
-    def pick(self, side: str, price: float | None) -> float | None:
-        shown = self.shown
+    def _spot(self, price: float | None) -> float:
+        return price if isinstance(price, (int, float)) and price > 0 else self.last_close
+
+    def pick(self, side: str, price: float | None, min_ratio: float = 0) -> float | None:
+        """En büyük kova. Eşik verilirse TP'si fiyata o orandan yakın kovalar atlanır."""
         if self.window is None:
             return None
-        spot = price if isinstance(price, (int, float)) and price > 0 else (shown.closes[-1] if shown.closes else 0)
+        spot = self._spot(price)
         if spot <= 0:
             return None
-        for level, _usd in self.top:
+        for level, _usd in self.entries:
             if not _tp_stays_beyond(side, level, spot):
+                continue
+            if min_ratio > 0 and _fiyat_cok_yakin(spot, _take_profit(side, level), min_ratio):
                 continue
             return level
-        if self.complete:
-            return None
-        best: float | None = None
-        best_usd = 0.0
-        for level, usd in self._entries():
-            if not _tp_stays_beyond(side, level, spot):
-                continue
-            if best is None or usd > best_usd:
-                best_usd = usd
-                best = level
-        return best
+        return None
 
     def nearest_stop(self, side: str, price: float | None) -> float | None:
         """Kendi taraftaki en büyük küme. Long altta, short üstte."""
-        shown = self.shown
         if self.window is None or side not in ("up", "down"):
             return None
-        spot = price if isinstance(price, (int, float)) and price > 0 else (shown.closes[-1] if shown.closes else 0)
+        spot = self._spot(price)
         if spot <= 0:
             return None
-        best: float | None = None
-        best_usd = 0.0
-        for level, usd in self._entries():
-            if side == "up" and level < spot and (best is None or usd > best_usd):
-                best, best_usd = level, usd
-            elif side == "down" and level > spot and (best is None or usd > best_usd):
-                best, best_usd = level, usd
-        if best is None or best == spot:
-            return None
-        return best
+        for level, _usd in self.entries:
+            if (side == "up" and level < spot) or (side == "down" and level > spot):
+                return level
+        return None
 
 
 def _clip_set(book: LiquidityMap, spans: set[int], target_hours: set[int], conserved: bool) -> tuple[dict, dict]:
+    """Ekranda gösterilen aralık tüm saat sütunlarıyla kurulur. Yalnız hedef olan aralık son saati tutar."""
     clips: dict[tuple[int, bool], LiquidityMap] = {}
     targets: dict[tuple[int, bool], _TargetTable] = {}
     for hours in sorted(spans | target_hours):
-        shown = clip_map(book, hours, conserved) if book.source_bars or book.venues else book
-        clips[(hours, conserved)] = shown
+        shown_on_screen = hours in spans
+        if book.source_bars or book.venues:
+            shown = clip_map(book, hours, conserved, keep_columns=shown_on_screen)
+        else:
+            shown = book
+        if shown_on_screen:
+            clips[(hours, conserved)] = shown
         if hours in target_hours:
             targets[(hours, conserved)] = _TargetTable(shown)
     return clips, targets
 
 
-class LiquidityWorker(QThread):
-    done = Signal(object)
-    failed = Signal(str)
+class LiquidityWorker(_CallWorker):
+    fallback = "likidasyon alınamadı"
 
     def __init__(self, symbol: str, span: int = 0, conserved: bool = False, hours: set[int] | None = None) -> None:
         super().__init__()
@@ -5792,16 +5848,12 @@ class LiquidityWorker(QThread):
         self._conserved = conserved
         self._hours = set(hours or ())
 
-    def run(self) -> None:
-        try:
-            book = load_liquidity(self._symbol)
-            hours = set(self._hours) if self._hours else set(SIGNAL_LIQ_HOURS.values())
-            clips, targets = _clip_set(book, hours, hours, self._conserved)
-            self.done.emit({"book": book, "clips": clips, "targets": targets})
-        except MarketError as exc:
-            self.failed.emit(str(exc))
-        except Exception as exc:
-            self.failed.emit(str(exc) or "likidasyon alınamadı")
+    def work(self):
+        book = load_liquidity(self._symbol)
+        hours = set(self._hours) if self._hours else set(SIGNAL_LIQ_HOURS.values())
+        spans = {self._span} if self._span else set()
+        clips, targets = _clip_set(book, spans, hours | spans, self._conserved)
+        return {"book": book, "clips": clips, "targets": targets}
 
 
 class _ClipWorker(QThread):
@@ -5825,12 +5877,11 @@ class _ClipWorker(QThread):
 class _LiqCandleWorker(QThread):
     done = Signal(object)
 
-    def __init__(self, symbol: str, interval: str, limit: int, bar_ms: int) -> None:
+    def __init__(self, symbol: str, interval: str, limit: int) -> None:
         super().__init__()
         self._symbol = symbol
         self._interval = interval
         self._limit = limit
-        self._bar_ms = bar_ms
 
     def run(self) -> None:
         try:
@@ -5838,16 +5889,6 @@ class _LiqCandleWorker(QThread):
         except MarketError:
             bars = []
         self.done.emit(bars)
-
-
-_TSI = timezone(timedelta(hours=3))
-
-
-def _tsi_clock(stamp_ms: int) -> str:
-    moment = datetime.fromtimestamp(stamp_ms / 1000, _TSI)
-    if moment.hour == 0 and moment.minute == 0:
-        return "24:00"
-    return f"{moment:%H:%M}"
 
 
 
@@ -5880,6 +5921,7 @@ class _RegimeWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        _drop_retired_signals()
         self._symbol, self._interval = _load_state()
         self._watch = _load_watchlist(self._symbol)
         if not isinstance(_read_state().get("watchlist"), list):
@@ -5957,7 +5999,6 @@ class MainWindow(QMainWindow):
         self._drawings = _load_drawings()
         self._last_trades: dict[str, float] = {}
         self._background = False
-        self._tray_hour_id: int | None = None
         self._tray_snap_gen: int | None = None
         self._signal_seen = _seed_signal_marks(int(time.time() * 1000))
         self._signal_due: set[str] = set()
@@ -6302,38 +6343,26 @@ class MainWindow(QMainWindow):
         self._show_coin_list()
         self.search.setFocus()
 
-    def _show_coin_list(self) -> None:
-        self._list_button.setChecked(True)
-        self._alarm_page.hide()
-        self._draw_page.hide()
-        self._indicator_page.hide()
-        self._coin_page.show()
+    def _show_page(self, button, page) -> None:
+        button.setChecked(True)
+        for other in (self._coin_page, self._alarm_page, self._draw_page, self._indicator_page):
+            if other is not page:
+                other.hide()
+        page.show()
         self._apply_draw_tool()
 
+    def _show_coin_list(self) -> None:
+        self._show_page(self._list_button, self._coin_page)
+
     def _show_alarm_list(self) -> None:
-        self._alarm_button.setChecked(True)
-        self._coin_page.hide()
-        self._draw_page.hide()
-        self._indicator_page.hide()
-        self._alarm_page.show()
-        self._apply_draw_tool()
+        self._show_page(self._alarm_button, self._alarm_page)
         self._fill_alarm_table()
 
     def _show_draw(self) -> None:
-        self._draw_button.setChecked(True)
-        self._coin_page.hide()
-        self._alarm_page.hide()
-        self._indicator_page.hide()
-        self._draw_page.show()
-        self._apply_draw_tool()
+        self._show_page(self._draw_button, self._draw_page)
 
     def _show_indicators(self) -> None:
-        self._indicator_button.setChecked(True)
-        self._coin_page.hide()
-        self._alarm_page.hide()
-        self._draw_page.hide()
-        self._indicator_page.show()
-        self._apply_draw_tool()
+        self._show_page(self._indicator_button, self._indicator_page)
 
     def _apply_draw_tool(self) -> None:
         tool = None
@@ -6348,17 +6377,29 @@ class MainWindow(QMainWindow):
                 tool = "fib"
         self.price_view.set_draw_tool(tool)
 
-    def _add_trend(self) -> None:
-        if self._trend.get("on"):
-            self.statusBar().showMessage("Trend zaten grafikte")
+    def _add_indicator(self, state: dict, name: str, store) -> None:
+        if state.get("on"):
+            self.statusBar().showMessage(f"{name} zaten grafikte")
             return
-        self._trend["on"] = True
-        self._trend["shown"] = True
-        self._store_trend()
+        state["on"] = True
+        state["shown"] = True
+        store()
+
+    @staticmethod
+    def _close_indicator(state: dict, store) -> None:
+        state["on"] = False
+        store()
+
+    @staticmethod
+    def _toggle_shown(state: dict, store) -> None:
+        state["shown"] = not bool(state.get("shown", True))
+        store()
+
+    def _add_trend(self) -> None:
+        self._add_indicator(self._trend, "Trend", self._store_trend)
 
     def _close_trend(self) -> None:
-        self._trend["on"] = False
-        self._store_trend()
+        self._close_indicator(self._trend, self._store_trend)
 
     def _edit_trend(self) -> None:
         _trend_dialog(self)
@@ -6370,28 +6411,19 @@ class MainWindow(QMainWindow):
         self._place_caption()
 
     def _hide_bollinger(self) -> None:
-        self._bb["shown"] = not bool(self._bb.get("shown", True))
-        self._store_bb()
+        self._toggle_shown(self._bb, self._store_bb)
 
     def _hide_signal(self) -> None:
-        self._signal["shown"] = not bool(self._signal.get("shown", True))
-        self._store_signal()
+        self._toggle_shown(self._signal, self._store_signal)
 
     def _hide_trend(self) -> None:
-        self._trend["shown"] = not bool(self._trend.get("shown", True))
-        self._store_trend()
+        self._toggle_shown(self._trend, self._store_trend)
 
     def _add_bollinger(self) -> None:
-        if self._bb.get("on"):
-            self.statusBar().showMessage("Bollinger Bandı zaten grafikte")
-            return
-        self._bb["on"] = True
-        self._bb["shown"] = True
-        self._store_bb()
+        self._add_indicator(self._bb, "Bollinger Bandı", self._store_bb)
 
     def _close_bollinger(self) -> None:
-        self._bb["on"] = False
-        self._store_bb()
+        self._close_indicator(self._bb, self._store_bb)
 
     def _edit_bollinger(self) -> None:
         updated = _bollinger_dialog(self, self._bb)
@@ -6401,16 +6433,10 @@ class MainWindow(QMainWindow):
         self._store_bb()
 
     def _add_signal(self) -> None:
-        if self._signal.get("on"):
-            self.statusBar().showMessage("Signal zaten grafikte")
-            return
-        self._signal["on"] = True
-        self._signal["shown"] = True
-        self._store_signal()
+        self._add_indicator(self._signal, "Signal", self._store_signal)
 
     def _close_signal(self) -> None:
-        self._signal["on"] = False
-        self._store_signal()
+        self._close_indicator(self._signal, self._store_signal)
 
     def _edit_signal(self) -> None:
         updated = _signal_dialog(self, self._signal)
@@ -6477,14 +6503,8 @@ class MainWindow(QMainWindow):
             label,
             bool(self._signal.get("show_closed", True)),
         )
-        score = _read_state().get("signal_score")
-        coin = score.get(self._symbol) if isinstance(score, dict) else {}
-        coin = coin if isinstance(coin, dict) else {}
+        coin = _symbol_entry(_read_state(), "signal_score", self._symbol)
         text = f"{label}  {_score_line(coin, label)}"
-        for name in ("Trend Long", "Trend Short"):
-            trend = _score_line(coin, name)
-            if trend != "doğruluk henüz yok":
-                text = f"{text}  ·  {name} {trend}"
         self.price_view.set_signals(marks, text)
 
     def _store_bb(self) -> None:
@@ -6809,7 +6829,7 @@ class MainWindow(QMainWindow):
         symbol = str(item.data(Qt.ItemDataRole.UserRole) or "")
         if not symbol or symbol == self._symbol:
             return
-        self._flush_held_signal()
+        self._release_held_signal()
         self._symbol = symbol
         _save_state(self._symbol, self._interval)
         self._show_symbol(symbol)
@@ -6889,6 +6909,7 @@ class MainWindow(QMainWindow):
         self._interval_box.blockSignals(False)
         self._interval_box.show_face()
         self._interval_box.currentIndexChanged.connect(self._on_interval_box)
+        self._interval_box.activated.connect(self._on_interval_box)
         header.addWidget(self._interval_box)
         refresh = QPushButton()
         refresh.setObjectName("tool")
@@ -7172,6 +7193,21 @@ class MainWindow(QMainWindow):
         self._okx_auto_lever.valueChanged.connect(self._on_auto_lever_changed)
         auto_lever_box.addWidget(self._okx_auto_lever)
         auto_spins.addLayout(auto_lever_box)
+        min_lever_box = QVBoxLayout()
+        min_lever_box.addWidget(QLabel("Minimum kaldıraç"))
+        self._okx_min_lever = QSpinBox()
+        self._okx_min_lever.setRange(1, 999)
+        self._okx_min_lever.setKeyboardTracking(False)
+        self._okx_min_lever.setValue(_min_leverage(data))
+        self._okx_min_lever_ok = int(self._okx_min_lever.value())
+        self._okx_min_lever.setFixedWidth(52)
+        self._okx_min_lever.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._okx_min_lever.setToolTip(
+            "Hesap bunun altındaysa emir bu kaldıraçla, kasanın tamamıyla açılır"
+        )
+        self._okx_min_lever.valueChanged.connect(self._on_min_lever_changed)
+        min_lever_box.addWidget(self._okx_min_lever)
+        auto_spins.addLayout(min_lever_box)
         auto_spins.addStretch(1)
         auto_column.addLayout(auto_spins)
         picks = QHBoxLayout()
@@ -7453,6 +7489,7 @@ class MainWindow(QMainWindow):
         for box, remembered in (
             (self._okx_lever, "_okx_lever_ok"),
             (self._okx_auto_lever, "_okx_auto_lever_ok"),
+            (self._okx_min_lever, "_okx_min_lever_ok"),
         ):
             if int(box.value()) <= cap:
                 setattr(self, remembered, int(box.value()))
@@ -7471,32 +7508,29 @@ class MainWindow(QMainWindow):
         if symbol == self._symbol:
             self._okx_cap = None
 
-    def _on_lever_changed(self, value: int) -> None:
+    def _on_saved_lever(self, box, remembered: str, value: int) -> None:
         if self._lever_hold:
             return
-        cap = self._okx_cap if self._okx_cap_symbol == self._symbol else None
+        raw = self._okx_cap if self._okx_cap_symbol == self._symbol else None
+        cap = raw if isinstance(raw, int) else None
         if cap and value > cap:
             self.statusBar().showMessage(f"OKX bu sözleşmede en fazla {cap}x kaldıraca izin veriyor")
             self._lever_hold = True
-            self._okx_lever.setValue(self._okx_lever_ok if 1 <= self._okx_lever_ok <= cap else cap)
+            previous = getattr(self, remembered)
+            box.setValue(previous if 1 <= previous <= cap else cap)
             self._lever_hold = False
             return
-        self._okx_lever_ok = int(value)
+        setattr(self, remembered, int(value))
         self._save_okx_form()
 
+    def _on_lever_changed(self, value: int) -> None:
+        self._on_saved_lever(self._okx_lever, "_okx_lever_ok", value)
+
     def _on_auto_lever_changed(self, value: int) -> None:
-        if self._lever_hold:
-            return
-        cap = self._okx_cap if self._okx_cap_symbol == self._symbol else None
-        if cap and value > cap:
-            self.statusBar().showMessage(f"OKX bu sözleşmede en fazla {cap}x kaldıraca izin veriyor")
-            self._lever_hold = True
-            previous = self._okx_auto_lever_ok
-            self._okx_auto_lever.setValue(previous if 1 <= previous <= cap else cap)
-            self._lever_hold = False
-            return
-        self._okx_auto_lever_ok = int(value)
-        self._save_okx_form()
+        self._on_saved_lever(self._okx_auto_lever, "_okx_auto_lever_ok", value)
+
+    def _on_min_lever_changed(self, value: int) -> None:
+        self._on_saved_lever(self._okx_min_lever, "_okx_min_lever_ok", value)
 
     def _show_okx_page(self, manual: bool) -> None:
         self._okx_stack.setCurrentIndex(1 if manual else 0)
@@ -7512,6 +7546,7 @@ class MainWindow(QMainWindow):
             okx_simulated=self._okx_simulated.isChecked(),
             okx_leverage=int(self._okx_lever.value()),
             okx_auto_leverage=int(self._okx_auto_lever.value()),
+            okx_min_leverage=int(self._okx_min_lever.value()),
             okx_form_page="manuel" if self._okx_manual_page.isChecked() else "otomatik",
             okx_risk_pct=float(self._okx_risk.value()),
             okx_margin_pct=int(self._okx_margin.value()),
@@ -7833,12 +7868,9 @@ class MainWindow(QMainWindow):
         generation = self._liq_gen
         if self._liq_map is None or self._liq_map.symbol != self._symbol:
             self._heat.set_state(None, "Yükleniyor")
-        hours = set(self._signal_hours)
-        if self._liq_span:
-            hours.add(self._liq_span)
-        if not hours:
-            hours = set(SIGNAL_LIQ_HOURS.values())
-        worker = LiquidityWorker(self._symbol, self._liq_span, self._liq_conserved, hours)
+        hours = set(self._signal_hours) or set(SIGNAL_LIQ_HOURS.values())
+        span = 0 if self._background else self._liq_span
+        worker = LiquidityWorker(self._symbol, span, self._liq_conserved, hours)
         worker.done.connect(lambda payload, gen=generation: self._on_liquidity(gen, payload))
         worker.failed.connect(lambda message, gen=generation: self._on_liquidity_fail(gen, message))
         self._launch(worker, "_liq_worker")
@@ -7941,10 +7973,10 @@ class MainWindow(QMainWindow):
             self._release_held_signal()
 
     def _load_liq_candles(self) -> None:
-        interval, bar_ms, limit = _liq_candle_spec(self._liq_span)
+        interval, _bar_ms, limit = _liq_candle_spec(self._liq_span)
         self._liq_candle_gen += 1
         generation = self._liq_candle_gen
-        worker = _LiqCandleWorker(self._symbol, interval, limit, bar_ms)
+        worker = _LiqCandleWorker(self._symbol, interval, limit)
         worker.done.connect(
             lambda bars, gen=generation, kind=interval: self._on_liq_candles(gen, kind, bars)
         )
@@ -7996,9 +8028,7 @@ class MainWindow(QMainWindow):
             kept = dict(episode)
             kept["target"] = target
             kept["side"] = side
-            positions = data.get("okx_positions")
-            coin = positions.get(self._symbol) if isinstance(positions, dict) else None
-            held = coin.get(label) if isinstance(coin, dict) else None
+            held = _symbol_entry(data, "okx_positions", self._symbol).get(label)
             if not isinstance(held, dict) or not stored_ok:
                 kept["tp"] = _take_profit(kept["side"], target)
             updated[label] = kept
@@ -8022,14 +8052,9 @@ class MainWindow(QMainWindow):
     def _paint_active(self) -> None:
         if not hasattr(self, "_active_signal_box"):
             return
-        stored = _read_state().get("signal_open")
-        entry = stored.get(self._symbol) if isinstance(stored, dict) else None
-        if not isinstance(entry, dict):
-            entry = {}
-        score = _read_state().get("signal_score")
-        coin = score.get(self._symbol) if isinstance(score, dict) else {}
-        if not isinstance(coin, dict):
-            coin = {}
+        data = _read_state()
+        entry = _symbol_entry(data, "signal_open", self._symbol)
+        coin = _symbol_entry(data, "signal_score", self._symbol)
         title = f"Aktif işlem · {base_of(self._symbol)}"
         total = _score_total(coin)
         self._active_title.setText(f"{title} · {total}" if total else title)
@@ -8055,8 +8080,6 @@ class MainWindow(QMainWindow):
             else:
                 detail = "Hedef yok"
             score_text = _score_line(coin, label)
-            if verdict in TREND_SCORE:
-                score_text = f"{score_text} · {verdict} {_score_line(coin, verdict)}"
             signal_rows.append((label, "—" if quiet else verdict, tone, f"{clock}  {detail} · {score_text}".strip()))
         live = getattr(self, "_okx_live", None) or []
         position_rows: list[tuple[str, str, str, str, str]] = []
@@ -8279,7 +8302,6 @@ class MainWindow(QMainWindow):
         if self._quitting:
             return
         self._background = True
-        self._tray_hour_id = int(time.time() * 1000) // HOUR_MS
         if hasattr(self, "_heat"):
             self._heat.set_live(False)
         self._timer.setInterval(BACKGROUND_MS)
@@ -8306,6 +8328,9 @@ class MainWindow(QMainWindow):
         self._funding_shown = []
         self._funding_drawn = None
         self._liq_clips = {}
+        if self._held_signal is None:
+            self._liq_map = None
+            self._liq_targets = {}
         if hasattr(self, "price_chart"):
             self._draw_candles([])
         if hasattr(self, "table"):
@@ -8342,7 +8367,6 @@ class MainWindow(QMainWindow):
         if not self._okx_timer.isActive():
             self._okx_timer.start()
         if was_hidden:
-            self._tray_hour_id = None
             self._start_list()
             self._start_snapshot(force=True, with_chart=True)
 
@@ -8368,30 +8392,8 @@ class MainWindow(QMainWindow):
         self._start_list()
         self._start_snapshot(force=False, panels=False)
 
-    def _tray_signal(self) -> None:
-        """Saat değişmediyse istek yok. Değişince saatlik ve üstü sinyal görüntüsü alınır."""
-        if is_index(self._symbol):
-            return
-        hour = int(time.time() * 1000) // HOUR_MS
-        if self._tray_hour_id == hour:
-            return
-        if self._thread_running("_snap"):
-            return
-        if not (set(self._windows_on) & set(SIGNAL_WINDOWS)):
-            self._tray_hour_id = hour
-            return
-        self._tray_hour_id = hour
-        self._start_snapshot(force=False, with_chart=False, tray=True)
-
     def _thread_running(self, attr: str) -> bool:
-        worker = getattr(self, attr)
-        if worker is None:
-            return False
-        try:
-            return bool(worker.isRunning())
-        except RuntimeError:
-            setattr(self, attr, None)
-            return False
+        return _alive(self, attr)
 
     def _launch(self, worker: QThread, attr: str) -> None:
         self._retained.append(worker)
@@ -8481,9 +8483,7 @@ class MainWindow(QMainWindow):
         generation = self._snap_gen
         if force and not self._background:
             self.statusBar().showMessage(f"{self._symbol} güncelleniyor")
-        stored = _read_state().get("signal_open")
-        entry = stored.get(self._symbol) if isinstance(stored, dict) else None
-        episodes = entry if isinstance(entry, dict) else {}
+        episodes = _symbol_entry(_read_state(), "signal_open", self._symbol)
         enabled = set(self._windows_on)
         if tray or decide:
             enabled &= set(self._signal_due or set(SIGNAL_WINDOWS))
@@ -8646,7 +8646,7 @@ class MainWindow(QMainWindow):
             return
         if symbol == self._symbol:
             return
-        self._flush_held_signal()
+        self._release_held_signal()
         self._symbol = symbol
         _save_state(self._symbol, self._interval)
         self._show_symbol(symbol)
@@ -8682,35 +8682,9 @@ class MainWindow(QMainWindow):
             return self._session_change
         return quote.change_pct
 
-    def _record_trend_long(self, snapshot: Snapshot) -> None:
-        tape = getattr(self, "_liq_tape", None)
-        if tape is None:
-            return
-        windows = {item.label: item for item in snapshot.windows}
-        reads = {item.label: item for item in snapshot.reads}
-        window = windows.get("1sa")
-        read = reads.get("1sa")
-        if window is None or read is None:
-            return
-        for builder in (trend_satiri, trend_short_satiri):
-            row = builder(
-                snapshot.symbol,
-                read.result,
-                window.closed_ms,
-                window.closed_close,
-                snapshot.funding_percent,
-                read.oi_state,
-                read.price_state,
-                window.cvd_spot,
-                window.cvd_perp,
-            )
-            if row is not None:
-                tape.note_trend_long(row)
-
     def _on_snapshot(self, generation: int, snapshot: Snapshot) -> None:
         if generation != self._snap_gen or snapshot.symbol != self._symbol:
             return
-        self._record_trend_long(snapshot)
         if generation == self._decide_gen:
             self._finish_due(snapshot)
         if self._background or generation == self._tray_snap_gen:
@@ -8718,7 +8692,7 @@ class MainWindow(QMainWindow):
         if generation != self._decide_gen and not snapshot.windows:
             self.header_price.setText(format_price(snapshot.price))
             fresh = list(snapshot.candles)[-CHART_BARS:]
-            if fresh:
+            if fresh and snapshot.interval == self._interval:
                 self._last_candles = fresh
                 self._draw_candles(self._last_candles)
             return
@@ -9030,18 +9004,7 @@ class MainWindow(QMainWindow):
         same_symbol = getattr(self, "_oi_drawn_symbol", None) == self._symbol
         kind = self._patch_line(self.oi_chart, points, values) if same_scale and same_symbol else None
         if kind is None:
-            self.oi_chart.removeAllSeries()
-            series = QLineSeries()
-            pen = series.pen()
-            pen.setColor(QColor("#7dd3fc"))
-            pen.setWidth(2)
-            series.setPen(pen)
-            for point, value in zip(points, values):
-                series.append(float(point.time_ms), value)
-            self.oi_chart.addSeries(series)
-            series.attachAxis(self.oi_x)
-            series.attachAxis(self.oi_y)
-            kind = "append"
+            kind = _rebuild_line(self.oi_chart, points, values, QColor("#7dd3fc"), self.oi_x, self.oi_y)
         self._oi_scale = (scale, unit)
         self._oi_drawn_symbol = self._symbol
         unit_label = f" ({unit})" if unit else ""
@@ -9083,18 +9046,7 @@ class MainWindow(QMainWindow):
         drawn = getattr(self, "_funding_drawn", None) == (self._symbol, self._funding_step)
         kind = self._patch_line(self.funding_chart, shown, values) if drawn else None
         if kind is None:
-            self.funding_chart.removeAllSeries()
-            series = QLineSeries()
-            pen = series.pen()
-            pen.setColor(AMBER)
-            pen.setWidth(2)
-            series.setPen(pen)
-            for point, value in zip(shown, values):
-                series.append(float(point.time_ms), value)
-            self.funding_chart.addSeries(series)
-            series.attachAxis(self.funding_x)
-            series.attachAxis(self.funding_y)
-            kind = "append"
+            kind = _rebuild_line(self.funding_chart, shown, values, AMBER, self.funding_x, self.funding_y)
         self._funding_drawn = (self._symbol, self._funding_step)
         self.funding_chart.setTitle(f"Funding  ·  {base_of(self._symbol)}  ·  72sa · {step}")
         if kind == "update":
@@ -9129,7 +9081,7 @@ class MainWindow(QMainWindow):
             table = self._liq_targets.get((span, self._liq_conserved))
             if table is None or table.symbol != self._symbol:
                 continue
-            level = table.pick(side, price)
+            level = table.pick(side, price, STOP_MIN_RATIO)
             if level is not None:
                 return level
         return None
@@ -9167,23 +9119,13 @@ class MainWindow(QMainWindow):
             table = self._liq_targets.get((span, self._liq_conserved))
             if table is None or table.symbol != self._symbol:
                 continue
-            if table.pick(side, price) is None:
+            if table.pick(side, price, STOP_MIN_RATIO) is None:
                 continue
             return table.pick(flip, price)
         return None
 
-    def _flush_held_signal(self) -> None:
-        """Coin değişince bekleyen sinyali duran haritayla kapatır."""
-        snapshot = getattr(self, "_held_signal", None)
-        if snapshot is None or snapshot.symbol != self._symbol:
-            return
-        self._held_signal = None
-        labels = getattr(self, "_held_labels", None)
-        self._maybe_telegram(snapshot, fresh=True, only=labels)
-        if not self._background and snapshot.windows:
-            self._fill_windows(snapshot)
-
     def _release_held_signal(self) -> None:
+        """Bekleyen sinyali eldeki haritayla kapatır. Coin değişince de çağrılır."""
         snapshot = getattr(self, "_held_signal", None)
         if snapshot is None or snapshot.symbol != self._symbol:
             return
@@ -9425,6 +9367,7 @@ class MainWindow(QMainWindow):
             "risk_pct": _risk_pct(data),
             "leverage": leverage,
             "lever_cap": _auto_leverage(data),
+            "lever_floor": _min_leverage(data),
             "mgn_mode": mode if mode in ("cross", "isolated") else "cross",
             "simulated": bool(data.get("okx_simulated")),
             "windows": windows,
@@ -9636,6 +9579,21 @@ class MainWindow(QMainWindow):
         self._render_okx_orders()
         self._paint_position_lines()
         self._paint_active()
+        self._release_closed_book()
+
+    def _release_closed_book(self) -> None:
+        """TP veya stop borsada kapattıysa elle işaretli kayıt emri kesmesin."""
+        data = _read_state()
+        stored = data.get("okx_positions")
+        if not isinstance(stored, dict) or not stored:
+            return
+        kept = _closed_book(stored, self._okx_live, self._okx_orders, not self._okx_order_error)
+        if kept == stored:
+            return
+        _patch_state(okx_positions=kept)
+        _okx_note("", "", "", True, "kayıt silindi: pozisyon borsada kapalı")
+        self._show_okx_log()
+        self._sync_feed()
 
     def _on_okx_positions_fail(self, message: str) -> None:
         self._okx_live_error = message
@@ -9653,7 +9611,7 @@ class MainWindow(QMainWindow):
         if not symbol or symbol == self._symbol:
             self._set_page("market")
             return
-        self._flush_held_signal()
+        self._release_held_signal()
         self._symbol = symbol
         _save_state(self._symbol, self._interval)
         self._show_symbol(symbol)
@@ -9779,7 +9737,7 @@ class MainWindow(QMainWindow):
         if not symbol or symbol == self._symbol:
             self._set_page("market")
             return
-        self._flush_held_signal()
+        self._release_held_signal()
         self._symbol = symbol
         _save_state(self._symbol, self._interval)
         self._show_symbol(symbol)
@@ -10256,12 +10214,41 @@ class MainWindow(QMainWindow):
             cell.setText(text)
             cell.setForeground(UP if pct > 0 else DOWN if pct < 0 else MUTED)
 
+    def _open_live_candle(self, price: float, opened: int) -> None:
+        """Süresi dolan mumu bırakır. Yeni mum hizalı açılışta başlar."""
+        candles = self._last_candles
+        if not candles or self._up_series is None:
+            return
+        previous = int(candles[-1].time_ms)
+        bar = Bar(opened, price, price, price, price, 0.0, 0.0)
+        candles.append(bar)
+        made = QCandlestickSet(price, price, price, price, opened)
+        self._up_series.append(made)
+        self._live_set = made
+        self._drawn_sets[opened] = made
+        self._drawn_times.append(opened)
+        self._live_up = True
+        self.price_view.set_last_price(opened, price, True)
+        if not self.price_view.zoomed and not self.price_view.price_manual:
+            self._fit_price()
+            return
+        start = int(self.price_x.min().toMSecsSinceEpoch())
+        end = int(self.price_x.max().toMSecsSinceEpoch())
+        if start <= previous <= end and opened > end:
+            step = opened - previous
+            _fit_x(self.price_x, start + step, end + step, self._interval)
+        self._fit_visible_price()
+
     def _touch_candle(self, price: float) -> None:
         candles = self._last_candles
         candle_set = self._live_set
         if not candles or candle_set is None:
             return
         bar = candles[-1]
+        opened = _chart_open_ms(int(time.time() * 1000), self._interval)
+        if int(bar.time_ms) < opened:
+            self._open_live_candle(price, opened)
+            return
         high = max(bar.high, price)
         low = min(bar.low, price)
         if price == bar.close and high == bar.high and low == bar.low:
@@ -10498,16 +10485,13 @@ class MainWindow(QMainWindow):
         step = points[-1].time_ms - points[-2].time_ms or BAR_FALLBACK
         scale = self._oi_scale[0] or 1.0
         values = [point.value / scale for point in points]
-        low, high = min(values), max(values)
-        pad = (high - low) * 0.08 or abs(high) * 0.002 or 0.01
         start_ms = points[0].time_ms
         end_ms = points[-1].time_ms + step
         _fit_x(self.oi_x, start_ms, end_ms, "15m")
-        y_low = max(0, low - pad)
-        y_high = high + pad
+        y_low, y_high = _oi_bounds(values)
         _fixed_ticks(self.oi_y, 4)
         self.oi_y.setRange(y_low, y_high)
-        self.oi_y.setLabelFormat("%.2f" if scale > 1 else _axis_format(high))
+        self.oi_y.setLabelFormat("%.2f" if scale > 1 else _axis_format(max(values)))
         self.oi_view.set_home(start_ms, end_ms, y_low, y_high)
 
     def _fit_visible_oi(self) -> None:
@@ -10522,18 +10506,14 @@ class MainWindow(QMainWindow):
         visible = [point.value / (self._oi_scale[0] or 1.0) for point in points if start <= point.time_ms <= end]
         if len(visible) < 2:
             return
-        low, high = min(visible), max(visible)
-        pad = (high - low) * 0.08 or abs(high) * 0.002 or 0.01
         _fixed_ticks(self.oi_y, 4)
-        self.oi_y.setRange(max(0, low - pad), high + pad)
+        self.oi_y.setRange(*_oi_bounds(visible))
 
     def _fit_funding(self) -> None:
         points = self._funding_shown
         if len(points) < 2:
             return
-        values = [point.value for point in points]
-        low, high = min(values), max(values)
-        pad = (high - low) * 0.15 or max(abs(high), abs(low), 0.01) * 0.2
+        y_low, y_high = _funding_bounds([point.value for point in points])
         start_ms = points[0].time_ms
         step_ms = 8 * 60 * 60 * 1000 if self._funding_step == "8h" else 60 * 60 * 1000
         end_ms = points[-1].time_ms + step_ms
@@ -10542,9 +10522,9 @@ class MainWindow(QMainWindow):
             QDateTime.fromMSecsSinceEpoch(start_ms),
             QDateTime.fromMSecsSinceEpoch(end_ms),
         )
-        _apply_price_scale(self.funding_y, low - pad, high + pad)
+        _apply_price_scale(self.funding_y, y_low, y_high)
         self.funding_y.setLabelFormat("%.4f")
-        self.funding_view.set_home(start_ms, end_ms, low - pad, high + pad)
+        self.funding_view.set_home(start_ms, end_ms, y_low, y_high)
 
     def _fit_visible_funding(self) -> None:
         points = self._funding_shown
@@ -10558,17 +10538,13 @@ class MainWindow(QMainWindow):
         visible = [point.value for point in points if start <= point.time_ms <= end]
         if len(visible) < 2:
             return
-        low, high = min(visible), max(visible)
-        pad = (high - low) * 0.15 or max(abs(high), abs(low), 0.01) * 0.2
-        _apply_price_scale(self.funding_y, low - pad, high + pad)
+        _apply_price_scale(self.funding_y, *_funding_bounds(visible))
         self.funding_y.setLabelFormat("%.4f")
 
     def _on_snap_fail(self, generation: int, message: str) -> None:
         if generation != self._snap_gen:
             return
         if self._background:
-            if generation == self._tray_snap_gen:
-                self._tray_hour_id = None
             return
         self.statusBar().showMessage(f"{self._symbol} alınamadı: {message}")
 
@@ -10616,9 +10592,9 @@ def _oi_unit(high: float) -> tuple[float, str]:
 def _verdict_color(text: str) -> QColor:
     if "Trap" in text:
         return AMBER
-    if text in {"Sağlıklı Long", "Short Squeeze", "Akümülasyon", "Trend Long"}:
+    if text in {"Sağlıklı Long", "Short Squeeze", "Akümülasyon"}:
         return UP
-    if text in {"Sağlıklı Short", "Long Squeeze", "Dağıtım", "Trend Short"}:
+    if text in {"Sağlıklı Short", "Long Squeeze", "Dağıtım"}:
         return DOWN
     return MUTED
 
@@ -10653,24 +10629,52 @@ def _with_base(value: float | None, base: str) -> str:
     return f"{format_amount(value)} {base}"
 
 
+def _oi_bounds(values: list[float]) -> tuple[float, float]:
+    low, high = min(values), max(values)
+    pad = (high - low) * 0.08 or abs(high) * 0.002 or 0.01
+    return max(0, low - pad), high + pad
+
+
+def _funding_bounds(values: list[float]) -> tuple[float, float]:
+    low, high = min(values), max(values)
+    pad = (high - low) * 0.15 or max(abs(high), abs(low), 0.01) * 0.2
+    return low - pad, high + pad
+
+
+def _rebuild_line(chart, points, values: list[float], color: QColor, axis_x, axis_y) -> str:
+    """Grafiğin tek çizgisini baştan kurar."""
+    chart.removeAllSeries()
+    series = QLineSeries()
+    pen = series.pen()
+    pen.setColor(color)
+    pen.setWidth(2)
+    series.setPen(pen)
+    for point, value in zip(points, values):
+        series.append(float(point.time_ms), value)
+    chart.addSeries(series)
+    series.attachAxis(axis_x)
+    series.attachAxis(axis_y)
+    return "append"
+
+
+def _dark_palette(palette: QPalette) -> QPalette:
+    palette.setColor(QPalette.ColorRole.Window, QColor("#0b0b0d"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#0b0b0d"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#e4e4e7"))
+    return palette
+
+
 def configure_app(app: QApplication) -> None:
     app.setStyle("Fusion")
     app.setFont(QFont("Segoe UI", 10))
     app.setStyleSheet(STYLESHEET)
-    palette = app.palette()
-    palette.setColor(QPalette.ColorRole.Window, QColor("#0b0b0d"))
-    palette.setColor(QPalette.ColorRole.Base, QColor("#0b0b0d"))
-    palette.setColor(QPalette.ColorRole.Text, QColor("#e4e4e7"))
+    palette = _dark_palette(app.palette())
     palette.setColor(QPalette.ColorRole.WindowText, QColor("#e4e4e7"))
     app.setPalette(palette)
 
 
 def _darken(widget: QWidget) -> None:
-    palette = widget.palette()
-    palette.setColor(QPalette.ColorRole.Base, QColor("#0b0b0d"))
-    palette.setColor(QPalette.ColorRole.Text, QColor("#e4e4e7"))
-    palette.setColor(QPalette.ColorRole.Window, QColor("#0b0b0d"))
-    widget.setPalette(palette)
+    widget.setPalette(_dark_palette(widget.palette()))
 
 
 def main() -> int:

@@ -10,12 +10,11 @@ from datetime import datetime, timezone
 
 import requests
 
+from desktop.net import HEADERS, TIMEOUT
 from desktop.readout import Read, build_reads
 
 FAPI = "https://fapi.binance.com"
 SPOT = "https://api.binance.com"
-HEADERS = {"User-Agent": "CryptoHub-Desktop"}
-TIMEOUT = 12
 
 CHART_INTERVALS = ("15m", "1h", "4h", "1d", "1w")
 CHART_BARS = 500
@@ -272,12 +271,6 @@ def _try_klines(symbol: str, interval: str, limit: int, futures: bool) -> list[B
         return []
 
 
-def _oi_points(symbol: str) -> list[Point]:
-    from desktop.oi_feed import load_oi
-
-    return list(load_oi(symbol).series.get("15m") or [])
-
-
 def bucket_funding(points: list[Point], hours: int) -> list[Point]:
     """Saatlik fonlamayı 8 saatlik ortalamalara toplar. Saatler UTC 00/08/16 sınırına oturur."""
     if hours <= 1 or not points:
@@ -321,27 +314,6 @@ def hourly_funding(
         if chosen is None:
             continue
         points.append(Point(moment, chosen))
-    return points
-
-
-def _funding_points(symbol: str) -> list[tuple[int, float]]:
-    start = int(time.time() * 1000) - (FUNDING_HOURS + 24) * HOUR_MS
-    try:
-        raw = _get(
-            f"{FAPI}/fapi/v1/fundingRate",
-            {"symbol": symbol, "startTime": start, "limit": 100},
-        )
-    except MarketError:
-        return []
-    if not isinstance(raw, list):
-        return []
-    points: list[tuple[int, float]] = []
-    for row in raw:
-        try:
-            points.append((int(row["fundingTime"]), float(row["fundingRate"]) * 100))
-        except (KeyError, TypeError, ValueError):
-            continue
-    points.sort(key=lambda item: item[0])
     return points
 
 
@@ -487,21 +459,6 @@ def _session_start_ms(now: datetime | None = None) -> int:
     return int(midnight.timestamp() * 1000)
 
 
-def _session_cvd(bars: list[Bar], now: datetime | None = None) -> float | None:
-    if not bars:
-        return None
-    start = _session_start_ms(now)
-    if bars[0].time_ms > start:
-        return None
-    return sum(bar.cvd_delta for bar in bars if bar.time_ms >= start)
-
-
-def _sum_cvd(bars: list[Bar], target: int, last_ms: int) -> float | None:
-    if not bars or bars[0].time_ms > target:
-        return None
-    return sum(bar.cvd_delta for bar in bars if target < bar.time_ms <= last_ms)
-
-
 # Her analiz aralığı kendi mumundadır. 8sa OI, 4sa ucundan hizalanır.
 ANALYSIS: tuple[tuple[str, str, int], ...] = (
     ("15dk", "15m", BAR_MS),
@@ -529,29 +486,6 @@ def _fresh(key: tuple, bar_ms: int, load):
     if found is not None:
         return found[1]
     return payload
-
-
-def _oi_hist(symbol: str, period: str, limit: int = 40) -> list[Point]:
-    try:
-        raw = _get(
-            f"{FAPI}/futures/data/openInterestHist",
-            {"symbol": symbol, "period": period, "limit": limit},
-        )
-    except MarketError:
-        return []
-    if not isinstance(raw, list):
-        return []
-    points: list[Point] = []
-    for row in raw:
-        try:
-            value = float(row["sumOpenInterest"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if value <= 0:
-            continue
-        points.append(Point(int(row["timestamp"]), value))
-    points.sort(key=lambda point: point.time_ms)
-    return points
 
 
 _INTERVAL_MS = {
@@ -623,13 +557,6 @@ def _fresh_klines(symbol: str, interval: str, futures: bool, bar_ms: int) -> lis
         bar_ms,
         lambda: cached_klines(symbol, interval, futures, 40),
     )
-
-
-def _fresh_oi(symbol: str, interval: str) -> list[Point]:
-    from desktop.oi_feed import load_oi
-
-    period = _OI_PERIOD[interval]
-    return list(load_oi(symbol).series.get(period) or [])
 
 
 def _aligned_oi(points: list[Point], bars: list[Bar], bar_ms: int) -> list[Point]:
@@ -712,10 +639,11 @@ def _one_window(
 
 
 def _chart_only(symbol: str, chart_interval: str) -> Snapshot:
-    """Açık pencerede dakikalık akış yalnız grafiği yeniler. Sinyal paketi burada çekilmez."""
+    """Açık pencerede dakikalık akış yalnız seçili aralığın grafiğini yeniler. Sinyal paketi burada çekilmez."""
     chart: list[Bar] = []
+    quarter = chart_interval == "15m"
     try:
-        chart = list(cached_klines(symbol, "15m", True, CHART_BARS, True))[-CHART_BARS:]
+        chart = list(cached_klines(symbol, chart_interval, True, CHART_BARS, quarter))[-CHART_BARS:]
     except MarketError:
         chart = []
     mark = None
@@ -728,7 +656,7 @@ def _chart_only(symbol: str, chart_interval: str) -> Snapshot:
     return Snapshot(
         symbol=symbol,
         base=base_of(symbol),
-        interval=chart_interval if chart_interval == "15m" else "15m",
+        interval=chart_interval,
         price=price,
         oi_base=None,
         oi_usd=None,
@@ -743,7 +671,7 @@ def _chart_only(symbol: str, chart_interval: str) -> Snapshot:
         reads=[],
         funding_hourly=[],
         warning=None,
-        session_change=_session_price_pct(chart),
+        session_change=_session_price_pct(chart) if quarter else None,
     )
 
 

@@ -294,8 +294,14 @@ def plan_risk(
     cap: int,
     tier_cap: int = 0,
     user_cap: int = 0,
+    user_floor: int = 1,
 ) -> tuple[int, float, float] | None:
-    """Kasa teminattır. Kaldıraç, stopta kayıp risk yüzdesini geçmeyecek en yüksek tam sayıdır."""
+    """Kasa teminattır. Kaldıraç, stopta kayıp risk yüzdesini geçmeyecek en yüksek tam sayıdır.
+
+    Hesap user_floor altındaysa kaldıraç o tabana çıkar ve teminat kasanın tamamı kalır.
+    Tabana ulaşılamazsa maksimum ve sözleşme tavanı kazanır. Taban 1 iken geniş stop
+    küçük teminatlı 1x hesabında kalır.
+    """
     if equity <= 0 or entry <= 0 or stop <= 0 or risk_pct <= 0:
         return None
     distance = abs(entry - stop) / entry
@@ -309,13 +315,14 @@ def plan_risk(
         ceiling = min(ceiling, user_cap)
     if ceiling < 1:
         return None
-    if goal < 1:
+    floor = max(1, int(user_floor or 1))
+    if goal < 1 and floor <= 1:
         notional = equity * (risk_pct / 100.0) / distance
         margin = min(equity, notional)
         if margin <= 0:
             return None
         return 1, margin, margin
-    lever = min(goal, ceiling)
+    lever = min(max(goal, floor), ceiling)
     return lever, equity, equity * lever
 
 
@@ -369,6 +376,7 @@ def size_for_risk(
     stop: float,
     mode: str,
     user_cap: int = 0,
+    user_floor: int = 1,
 ) -> tuple[int, float]:
     """Otomatik emrin kaldıracı ve marjini. Kasa teminattır; tavanın üstüne çıkmaz."""
     info = _public_instrument(inst_id(symbol))
@@ -378,7 +386,7 @@ def size_for_risk(
         cap = 0
     if cap < 1:
         raise OkxError("Kaldıraç sınırı alınamadı")
-    goal = plan_risk(equity, risk_pct, entry, stop, cap, 0, user_cap)
+    goal = plan_risk(equity, risk_pct, entry, stop, cap, 0, user_cap, user_floor)
     if goal is None:
         raise OkxError("Stop mesafesi yok, emir yok")
     lever, margin, notional = goal
@@ -922,8 +930,19 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
                 user_cap = int(settings.get("lever_cap") or 0)
             except (TypeError, ValueError):
                 user_cap = 0
+            try:
+                user_floor = int(settings.get("lever_floor") or 1)
+            except (TypeError, ValueError):
+                user_floor = 1
             leverage, margin = size_for_risk(
-                symbol, equity, risk_pct, spot, float(raw_sl), mode, max(0, user_cap)
+                symbol,
+                equity,
+                risk_pct,
+                spot,
+                float(raw_sl),
+                mode,
+                max(0, user_cap),
+                max(1, user_floor),
             )
             budget = str(action.get("budget") or "risk")
             if budget == "third":
@@ -978,19 +997,6 @@ def execute(creds: Creds, symbol: str, price: float, settings: dict, actions: li
             position["limits"] = limits
         results.append(_row(symbol, label, "open", True, " · ".join(notes), position))
     return results
-
-
-def _flatten_inst(creds: Creds, symbol: str, simulated: bool) -> None:
-    """Açılıştan önce bu sözleşmede duran pozisyonu kapatır."""
-    inst = inst_id(symbol)
-    for position in fetch_positions(creds, simulated):
-        if position.get("inst") != inst or not str(position.get("sz") or ""):
-            continue
-        try:
-            _close(creds, position, simulated)
-        except OkxError as exc:
-            if not _flat(str(exc)):
-                raise
 
 
 def _drop_limits(creds: Creds, held: dict, simulated: bool) -> None:

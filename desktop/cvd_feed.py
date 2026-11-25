@@ -9,7 +9,6 @@ Kopuş sıfır yazılmaz. Üç boş gelişte kitap pencereden düşer.
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -18,8 +17,8 @@ from datetime import datetime, timezone
 
 import requests
 
-HEADERS = {"User-Agent": "CryptoHub-Desktop"}
-TIMEOUT = 12
+from desktop.net import HEADERS, TIMEOUT, cache_path
+
 BAR_MS = 15 * 60 * 1000
 FIVE_MS = 5 * 60 * 1000
 HOUR_MS = 60 * 60 * 1000
@@ -120,10 +119,7 @@ def _session_start(now_ms: int) -> int:
 
 
 def _path() -> str:
-    root = os.environ.get("APPDATA") or os.path.expanduser("~")
-    folder = os.path.join(root, "CryptoHub")
-    os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, "cvd_bars.json")
+    return cache_path("cvd_bars.json")
 
 
 def _book_has_bars(book: dict) -> bool:

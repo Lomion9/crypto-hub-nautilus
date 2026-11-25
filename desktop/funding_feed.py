@@ -13,12 +13,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-import requests
-
 from desktop.market import FUNDING_HOURS, HOUR_MS, Point
+from desktop.net import get_json as _get
+from desktop.net import post_json as _post
+from desktop.oi_feed import _bitfinex_key, _htx_missing
 
-HEADERS = {"User-Agent": "CryptoHub-Desktop"}
-TIMEOUT = 12
 DROP_AFTER = 3
 
 _LOCK = threading.Lock()
@@ -74,16 +73,6 @@ def blend(parts: list[tuple[float, float]]) -> float | None:
     if den <= 0:
         return None
     return num / den
-
-
-def apply_carry(fresh: float | None, kept: float | None, fails: int) -> tuple[float | None, int]:
-    """Bir kopuşta eski oran durur. Üçüncü boş gelişte düşer. Yokluk sıfır olmaz."""
-    if fresh is not None:
-        return fresh, 0
-    fails += 1
-    if fails < DROP_AFTER and kept is not None:
-        return kept, fails
-    return None, fails
 
 
 def _percent(raw: float, hours: float) -> float | None:
@@ -249,30 +238,6 @@ def _oi_at(points: list[Point], moment: int) -> float | None:
     return chosen
 
 
-def _get(url: str, params: dict | None = None):
-    try:
-        response = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
-    except requests.RequestException:
-        return None
-    try:
-        return response.json()
-    except ValueError:
-        return None
-
-
-def _post(url: str, body: dict):
-    try:
-        response = requests.post(
-            url,
-            json=body,
-            headers={**HEADERS, "Content-Type": "application/json"},
-            timeout=TIMEOUT,
-        )
-        return response.json()
-    except (requests.RequestException, ValueError):
-        return None
-
-
 def _gap_hours(stamps: list[int]) -> float | None:
     ordered = sorted({int(stamp) for stamp in stamps if stamp})
     gaps = [ordered[index] - ordered[index - 1] for index in range(1, len(ordered))]
@@ -366,14 +331,6 @@ def _binance_linear(coin: str, quote: str) -> tuple[str, Quote | None]:
     return "ok", Quote(raw, hours, nxt, settled)
 
 
-def _binance_usdt(coin: str) -> tuple[str, Quote | None]:
-    return _binance_linear(coin, "USDT")
-
-
-def _binance_usdc(coin: str) -> tuple[str, Quote | None]:
-    return _binance_linear(coin, "USDC")
-
-
 def _binance_usd(coin: str) -> tuple[str, Quote | None]:
     symbol = f"{coin}USD_PERP"
     payload = _get("https://dapi.binance.com/dapi/v1/premiumIndex", {"symbol": symbol})
@@ -432,18 +389,6 @@ def _bybit(category: str, symbol: str) -> tuple[str, Quote | None]:
     return "ok", Quote(raw, hours, nxt, settled)
 
 
-def _bybit_usdt(coin: str) -> tuple[str, Quote | None]:
-    return _bybit("linear", f"{coin}USDT")
-
-
-def _bybit_usdc(coin: str) -> tuple[str, Quote | None]:
-    return _bybit("linear", f"{coin}PERP")
-
-
-def _bybit_usd(coin: str) -> tuple[str, Quote | None]:
-    return _bybit("inverse", f"{coin}USD")
-
-
 def _okx(inst: str) -> tuple[str, Quote | None]:
     payload = _get("https://www.okx.com/api/v5/public/funding-rate", {"instId": inst})
     if not isinstance(payload, dict):
@@ -479,23 +424,12 @@ def _okx(inst: str) -> tuple[str, Quote | None]:
     return "ok", Quote(raw, hours, nxt, settled)
 
 
-def _okx_usdt(coin: str) -> tuple[str, Quote | None]:
-    return _okx(f"{coin}-USDT-SWAP")
-
-
-def _okx_usd(coin: str) -> tuple[str, Quote | None]:
-    return _okx(f"{coin}-USD-SWAP")
-
-
 def _htx(live_url: str, hist_url: str, code: str) -> tuple[str, Quote | None]:
     payload = _get(live_url, {"contract_code": code})
     if not isinstance(payload, dict):
         return "down", None
     if payload.get("status") != "ok":
-        message = str(payload.get("err_msg") or "").lower()
-        if "contract" in message or "exist" in message:
-            return "miss", None
-        return "down", None
+        return ("miss" if _htx_missing(payload) else "down"), None
     row = payload.get("data") if isinstance(payload.get("data"), dict) else None
     history = _get(hist_url, {"contract_code": code, "page_index": 1, "page_size": 48})
     nested = history.get("data") if isinstance(history, dict) else None
@@ -512,24 +446,9 @@ def _htx(live_url: str, hist_url: str, code: str) -> tuple[str, Quote | None]:
     return "ok", Quote(raw, hours, nxt, settled)
 
 
-def _htx_usdt(coin: str) -> tuple[str, Quote | None]:
-    return _htx(
-        "https://api.hbdm.com/linear-swap-api/v1/swap_funding_rate",
-        "https://api.hbdm.com/linear-swap-api/v1/swap_historical_funding_rate",
-        f"{coin}-USDT",
-    )
-
-
-def _htx_usd(coin: str) -> tuple[str, Quote | None]:
-    return _htx(
-        "https://api.hbdm.com/swap-api/v1/swap_funding_rate",
-        "https://api.hbdm.com/swap-api/v1/swap_historical_funding_rate",
-        f"{coin}-USD",
-    )
-
-
-def _bitfinex_key(coin: str) -> str:
-    return f"t{coin}F0:USTF0"
+def _htx_pair(api: str, code: str) -> tuple[str, Quote | None]:
+    root = f"https://api.hbdm.com/{api}/v1"
+    return _htx(f"{root}/swap_funding_rate", f"{root}/swap_historical_funding_rate", code)
 
 
 def _bitfinex(coin: str) -> tuple[str, Quote | None]:
@@ -743,16 +662,16 @@ def _woo(coin: str) -> tuple[str, Quote | None]:
 
 
 _FETCH = {
-    "binance-usdt": _binance_usdt,
-    "binance-usdc": _binance_usdc,
+    "binance-usdt": lambda coin: _binance_linear(coin, "USDT"),
+    "binance-usdc": lambda coin: _binance_linear(coin, "USDC"),
     "binance-usd": _binance_usd,
-    "bybit-usdt": _bybit_usdt,
-    "bybit-usdc": _bybit_usdc,
-    "bybit-usd": _bybit_usd,
-    "okx-usdt": _okx_usdt,
-    "okx-usd": _okx_usd,
-    "htx-usdt": _htx_usdt,
-    "htx-usd": _htx_usd,
+    "bybit-usdt": lambda coin: _bybit("linear", f"{coin}USDT"),
+    "bybit-usdc": lambda coin: _bybit("linear", f"{coin}PERP"),
+    "bybit-usd": lambda coin: _bybit("inverse", f"{coin}USD"),
+    "okx-usdt": lambda coin: _okx(f"{coin}-USDT-SWAP"),
+    "okx-usd": lambda coin: _okx(f"{coin}-USD-SWAP"),
+    "htx-usdt": lambda coin: _htx_pair("linear-swap-api", f"{coin}-USDT"),
+    "htx-usd": lambda coin: _htx_pair("swap-api", f"{coin}-USD"),
     "bitfinex-usdt": _bitfinex,
     "woo-usdt": _woo,
     "deribit-usd": _deribit,

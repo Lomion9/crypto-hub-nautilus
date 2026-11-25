@@ -25,9 +25,6 @@ from PySide6.QtWebSockets import QWebSocket
 
 from desktop.liquidity import LEVERAGE, build_map
 from desktop.market import HOUR_MS, Bar, MarketError, Point, fetch_klines, fetch_oi_page
-from desktop.trend_kayit import ensure as ensure_trend_kayit
-from desktop.trend_kayit import kaydet as kaydet_trend_long
-
 STREAM = "wss://fstream.binance.com/market/ws/btcusdt@forceOrder"
 LIQ_SYMBOL = "BTCUSDT"
 TAPE_SYMBOLS = ("BTCUSDT",)
@@ -161,7 +158,6 @@ def _ensure(conn: sqlite3.Connection) -> None:
         );
         """
     )
-    ensure_trend_kayit(conn)
     found = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='force_order'"
     ).fetchone()
@@ -534,16 +530,20 @@ class LiquidationTape(QObject):
             now = int(time.time() * 1000)
             self._flush(now, advance=pong_fresh(self._last_pong, now))
 
+    def _drain_buf(self) -> None:
+        """Kilit tutulurken çağrılır. Bekleyen olaylar tabloya yazılır."""
+        if self._buf:
+            self._db.executemany(
+                "INSERT OR IGNORE INTO liq (t_ms, sembol, yon, fiyat, miktar, dolar) VALUES (?,?,?,?,?,?)",
+                self._buf,
+            )
+            self._buf.clear()
+
     def _flush(self, now_ms: int, advance: bool) -> None:
         if not self._db_ready:
             return
         with self._lock:
-            if self._buf:
-                self._db.executemany(
-                    "INSERT OR IGNORE INTO liq (t_ms, sembol, yon, fiyat, miktar, dolar) VALUES (?,?,?,?,?,?)",
-                    self._buf,
-                )
-                self._buf.clear()
+            self._drain_buf()
             if advance and self._session_id is not None:
                 self._db.execute(
                     "UPDATE oturum SET kapandi_ms=? WHERE rowid=?",
@@ -555,12 +555,7 @@ class LiquidationTape(QObject):
         if not self._db_ready:
             return
         with self._lock:
-            if self._buf:
-                self._db.executemany(
-                    "INSERT OR IGNORE INTO liq (t_ms, sembol, yon, fiyat, miktar, dolar) VALUES (?,?,?,?,?,?)",
-                    self._buf,
-                )
-                self._buf.clear()
+            self._drain_buf()
             if self._session_id is not None:
                 self._db.execute(
                     "UPDATE oturum SET kapandi_ms=? WHERE rowid=?",
@@ -592,20 +587,6 @@ class LiquidationTape(QObject):
         hour = int(time.time() * 1000) // HOUR_MS * HOUR_MS
         self.note_signal(hour, None, "saat")
         self._kick_archive()
-
-    def note_trend_long(self, row: dict) -> bool:
-        """Kapanmış BTC saatini bir kez yazar. Getiri kolonlarını boş bırakır."""
-        if not self._db_ready or not isinstance(row, dict):
-            return False
-        with self._lock:
-            try:
-                written = kaydet_trend_long(self._db, row, str(row.get("tablo") or "trend_long_kayit"))
-                if written:
-                    self._db.commit()
-            except sqlite3.Error:
-                self._db.rollback()
-                return False
-        return written
 
     def note_signal(self, as_of: int, price: float | None, kaynak: str = "sinyal") -> None:
         """Küme listesini kuyruğa alır. Sinyal ve emir bu çağrıdan dönmez."""

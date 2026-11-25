@@ -84,10 +84,6 @@ def is_index(symbol: str) -> bool:
     return symbol in _BY_SYMBOL
 
 
-def index_spec(symbol: str) -> IndexSpec | None:
-    return _BY_SYMBOL.get(symbol)
-
-
 def index_label(symbol: str) -> str:
     return symbol if symbol in _BY_SYMBOL else symbol
 

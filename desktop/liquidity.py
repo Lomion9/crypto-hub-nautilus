@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import threading
 import time
 import urllib.request
@@ -23,10 +22,13 @@ from desktop.market import (
     Bar,
     MarketError,
     Point,
+    _bars,
     fetch_hourly_oi,
     fetch_klines,
     fetch_leverage_tier,
 )
+from desktop.net import cache_path, post_json
+from desktop.oi_feed import _bitfinex_key, _inverse_coin
 
 # 3x ve 4x yok. Görünür bant 25x, 50x ve 100x'te daha ağır. Toplam 12.
 LEVERAGE = {5: 3, 10: 3, 20: 1, 25: 2, 50: 2, 100: 1}
@@ -260,10 +262,12 @@ def build_map(
     inverse: bool = False,
     as_of: int | None = None,
     weights: dict[int, float] | None = None,
+    keep_columns: bool = True,
 ) -> LiquidityMap:
     """Saat saat açık pozisyonu kovalar. OI artışı yeni pozisyon, düşüş oransal kapanıştır.
     sweep: saat → (en düşük, en yüksek); grafikte gösterilen borsanın fitili de silmeye katılır.
-    as_of verilirse yalnız o ana kadarki mum ve açık pozisyon girer. weights verilmezse LEVERAGE durur."""
+    as_of verilirse yalnız o ana kadarki mum ve açık pozisyon girer. weights verilmezse LEVERAGE durur.
+    keep_columns kapalıysa yalnız son saatin sütunu tutulur; mum serisi ve tepeler aynı kalır."""
     if as_of is not None:
         bars = [bar for bar in bars if bar.time_ms <= as_of]
         oi_points = [point for point in oi_points if point.time_ms <= as_of]
@@ -346,6 +350,11 @@ def build_map(
         closes.append(bar.close)
         lows.append(bar.low)
         highs.append(bar.high)
+        if keep_columns:
+            column, found = _snapshot(longs, long_mass, shorts, short_mass, step)
+            columns.append(column)
+            levels.append(found)
+    if not keep_columns and times:
         column, found = _snapshot(longs, long_mass, shorts, short_mass, step)
         columns.append(column)
         levels.append(found)
@@ -392,8 +401,14 @@ def _peaks_usd(
     return [Cluster(level, usd) for level, usd in kept]
 
 
-def merge_venues(symbol: str, venues: list[VenueBook], conserved: bool = False) -> LiquidityMap:
-    """Her borsanın kendi haritasını kurar, dolar kovalarını ortak adımda toplar."""
+def merge_venues(
+    symbol: str,
+    venues: list[VenueBook],
+    conserved: bool = False,
+    keep_columns: bool = True,
+) -> LiquidityMap:
+    """Her borsanın kendi haritasını kurar, dolar kovalarını ortak adımda toplar.
+    Borsa haritası toplanınca bırakılır. keep_columns kapalıysa yalnız son saatin sütunu kalır."""
     sweep_venue = next((venue for venue in venues if venue.name == "binance-usdt"), None)
     if sweep_venue is None and venues:
         sweep_venue = venues[0]
@@ -402,8 +417,14 @@ def merge_venues(symbol: str, venues: list[VenueBook], conserved: bool = False) 
         for bar in sweep_venue.bars:
             if bar.low > 0 and bar.high > 0:
                 sweep[bar.time_ms // HOUR_MS * HOUR_MS] = (bar.low, bar.high)
-    built = [
-        build_map(
+    result = LiquidityMap(symbol=symbol.upper(), step=1.0, venues=list(venues))
+    anchor = next((venue.bars[-1].close for venue in venues if venue.bars and venue.bars[-1].close > 0), 0.0)
+    if anchor <= 0:
+        return result
+    step = nice_step(anchor)
+    slots: dict[int, list] = {}
+    for venue in venues:
+        book = build_map(
             symbol,
             venue.bars,
             venue.oi,
@@ -412,26 +433,19 @@ def merge_venues(symbol: str, venues: list[VenueBook], conserved: bool = False) 
             conserved,
             sweep,
             venue.inverse,
+            keep_columns=keep_columns,
         )
-        for venue in venues
-    ]
-    built = [book for book in built if book.times and book.closes]
-    result = LiquidityMap(symbol=symbol.upper(), step=1.0, venues=list(venues))
-    if not built:
-        return result
-    anchor = next((book.closes[-1] for book in built if book.closes[-1] > 0), 0.0)
-    if anchor <= 0:
-        return result
-    step = nice_step(anchor)
-    slots: dict[int, list] = {}
-    for book in built:
+        if not book.times or not book.closes:
+            continue
         src_step = book.step
         same = src_step == step
+        offset = len(book.times) - len(book.columns)
         for index, stamp in enumerate(book.times):
             hour = stamp // HOUR_MS * HOUR_MS
-            prices = book.levels[index] if index < len(book.levels) else {}
+            spot = index - offset
+            prices = book.levels[spot] if 0 <= spot < len(book.levels) else {}
             price_get = prices.get
-            column = book.columns[index]
+            column = book.columns[spot] if spot >= 0 else {}
             slot = slots.get(hour)
             if slot is None and same:
                 usd_column = {bucket: usd for bucket, usd in column.items() if usd > 0}
@@ -458,18 +472,25 @@ def merge_venues(symbol: str, venues: list[VenueBook], conserved: bool = False) 
                 dest = bucket if same else int(((bucket + 0.5) * src_step) / step)
                 usd_column[dest] = usd_get(dest, 0.0) + usd
                 mass_column[dest] = mass_get(dest, 0.0) + raw * usd
-    for hour in sorted(slots):
+        del book
+    if not slots:
+        return result
+    ordered = sorted(slots)
+    last_hour = ordered[-1]
+    for hour in ordered:
         opened, closed, low, high, column, mass = slots[hour]
-        level_column = {
-            bucket: mass[bucket] / column[bucket]
-            for bucket in column
-            if column[bucket] > 0 and mass.get(bucket, 0) > 0
-        }
         result.times.append(hour)
         result.opens.append(opened)
         result.closes.append(closed)
         result.lows.append(low)
         result.highs.append(high)
+        if not keep_columns and hour != last_hour:
+            continue
+        level_column = {
+            bucket: mass[bucket] / column[bucket]
+            for bucket in column
+            if column[bucket] > 0 and mass.get(bucket, 0) > 0
+        }
         result.columns.append(column)
         result.levels.append(level_column)
     result.step = step
@@ -553,47 +574,12 @@ def _binance_usdc_venue(symbol: str) -> VenueBook | None:
     return _trim_venue(bars, oi_points, margin, leverage, "binance-usdc")
 
 
-def _inverse_coin(contracts: float, value: float, mark: float | None, size: float) -> float | None:
-    """Coin-M geçmişinde value bazen coin, bazen dolar. Mark ile ayırt edilir."""
-    if contracts <= 0 or size <= 0:
-        return None
-    if mark and mark > 0:
-        from_contracts = contracts * size / mark
-        if value > 0 and abs(value - from_contracts) / from_contracts < 0.35:
-            return value
-        return from_contracts
-    if value > 0 and value < contracts:
-        return value
-    return None
-
-
 def _dapi_bars(symbol: str) -> list[Bar]:
     payload = _read_json(
         "https://dapi.binance.com/dapi/v1/klines"
         f"?symbol={quote(symbol)}&interval=1h&limit=800"
     )
-    if not isinstance(payload, list):
-        return []
-    bars: list[Bar] = []
-    for row in payload:
-        try:
-            volume = float(row[5])
-            taker_buy = float(row[9])
-            bars.append(
-                Bar(
-                    time_ms=int(row[0]),
-                    open=float(row[1]),
-                    high=float(row[2]),
-                    low=float(row[3]),
-                    close=float(row[4]),
-                    cvd_delta=taker_buy - (volume - taker_buy),
-                    volume=volume,
-                )
-            )
-        except (IndexError, TypeError, ValueError):
-            continue
-    bars.sort(key=lambda bar: bar.time_ms)
-    return bars
+    return _bars(payload) if isinstance(payload, list) else []
 
 
 def _dapi_oi(coin: str) -> list[Point]:
@@ -646,18 +632,6 @@ def _binance_usd_venue(symbol: str) -> VenueBook | None:
     points = _dapi_oi(coin)
     margin, leverage = 0.004, 100
     return _trim_venue(bars, points, margin, leverage, "binance-usd", True)
-
-
-def _bybit_venue(symbol: str) -> VenueBook | None:
-    return _bybit_book(symbol, "linear", "bybit-usdt", False)
-
-
-def _bybit_usdc_venue(symbol: str) -> VenueBook | None:
-    return _bybit_book(f"{_coin(symbol)}PERP", "linear", "bybit-usdc", False)
-
-
-def _bybit_usd_venue(symbol: str) -> VenueBook | None:
-    return _bybit_book(f"{_coin(symbol)}USD", "inverse", "bybit-usd", True)
 
 
 def _bybit_book(market: str, category: str, name: str, inverse: bool) -> VenueBook | None:
@@ -762,16 +736,6 @@ def _okx_pages(url: str, pages: int) -> list:
         if len(batch) < 100:
             break
     return rows
-
-
-def _okx_venue(symbol: str) -> VenueBook | None:
-    inst, family = _okx_inst(symbol)
-    return _okx_book(inst, family, "okx-usdt", False)
-
-
-def _okx_usd_venue(symbol: str) -> VenueBook | None:
-    coin = _coin(symbol)
-    return _okx_book(f"{coin}-USD-SWAP", f"{coin}-USD", "okx-usd", True)
 
 
 def _okx_book(inst: str, family: str, name: str, inverse: bool) -> VenueBook | None:
@@ -890,58 +854,42 @@ def _okx_book(inst: str, family: str, name: str, inverse: bool) -> VenueBook | N
 HL_INFO = "https://api.hyperliquid.xyz/info"
 
 
-def _post_json(url: str, body: dict):
-    try:
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json", "User-Agent": "CryptoHub"},
-        )
-        with urllib.request.urlopen(request, timeout=12) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except (OSError, json.JSONDecodeError, TimeoutError, ValueError):
-        return None
+_SAMPLE_LOCK = threading.Lock()
 
 
-def _hl_oi_path() -> str:
-    root = os.environ.get("APPDATA") or os.path.expanduser("~")
-    folder = os.path.join(root, "CryptoHub")
-    os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, "hl_oi.json")
-
-
-def _hl_oi_series(coin: str, live: float, now_ms: int) -> list[Point]:
-    """Hyperliquid yalnızca anlık açık pozisyon verir. Her saat o değer saklanır."""
-    path = _hl_oi_path()
-    stored: dict = {}
-    try:
-        with open(path, encoding="utf-8") as handle:
-            raw = json.load(handle)
-        if isinstance(raw, dict):
-            stored = raw
-    except (OSError, json.JSONDecodeError):
-        stored = {}
-    points: list[Point] = []
-    rows = stored.get(coin)
-    if isinstance(rows, list):
-        for row in rows:
-            try:
-                points.append(Point(int(row[0]), float(row[1])))
-            except (IndexError, TypeError, ValueError):
-                continue
-    hour = now_ms // HOUR_MS * HOUR_MS
-    if live > 0 and (not points or points[-1].time_ms != hour):
-        points.append(Point(hour, live))
-    cutoff = hour - 40 * 24 * HOUR_MS
-    points = [point for point in points if point.time_ms >= cutoff and point.value > 0]
-    points.sort(key=lambda point: point.time_ms)
-    stored[coin] = [[point.time_ms, point.value] for point in points]
-    try:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(stored, handle)
-    except OSError:
-        pass
-    return points
+def _hourly_samples(name: str, key: str, live: float, now_ms: int) -> list[Point]:
+    """Yalnız anlık açık pozisyon veren kitapta her saat bir örnek. 40 gün tutulur. Tek örnek kütle yazmaz."""
+    path = cache_path(name)
+    with _SAMPLE_LOCK:
+        stored: dict = {}
+        try:
+            with open(path, encoding="utf-8") as handle:
+                raw = json.load(handle)
+            if isinstance(raw, dict):
+                stored = raw
+        except (OSError, json.JSONDecodeError):
+            stored = {}
+        points: list[Point] = []
+        rows = stored.get(key)
+        if isinstance(rows, list):
+            for row in rows:
+                try:
+                    points.append(Point(int(row[0]), float(row[1])))
+                except (IndexError, TypeError, ValueError):
+                    continue
+        hour = now_ms // HOUR_MS * HOUR_MS
+        if live > 0 and (not points or points[-1].time_ms != hour):
+            points.append(Point(hour, live))
+        cutoff = hour - 40 * 24 * HOUR_MS
+        points = [point for point in points if point.time_ms >= cutoff and point.value > 0]
+        points.sort(key=lambda point: point.time_ms)
+        stored[key] = [[point.time_ms, point.value] for point in points]
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(stored, handle)
+        except OSError:
+            pass
+        return points
 
 
 def _hyperliquid_venue(symbol: str) -> VenueBook | None:
@@ -953,7 +901,7 @@ def _hyperliquid_venue(symbol: str) -> VenueBook | None:
     bars: list[Bar] = []
     seen: set[int] = set()
     for _ in range(4):
-        payload = _post_json(
+        payload = post_json(
             HL_INFO,
             {
                 "type": "candleSnapshot",
@@ -987,7 +935,7 @@ def _hyperliquid_venue(symbol: str) -> VenueBook | None:
             break
         start = last + HOUR_MS
     bars.sort(key=lambda bar: bar.time_ms)
-    snapshot = _post_json(HL_INFO, {"type": "metaAndAssetCtxs"})
+    snapshot = post_json(HL_INFO, {"type": "metaAndAssetCtxs"})
     if not isinstance(snapshot, list) or len(snapshot) < 2:
         return None
     meta, contexts = snapshot[0], snapshot[1]
@@ -1030,7 +978,7 @@ def _hyperliquid_venue(symbol: str) -> VenueBook | None:
             levers.append(40)
     leverage = max(levers)
     margin = 1.0 / (2 * leverage) if leverage >= 1 else 0.004
-    points = _hl_oi_series(coin, live_oi, now_ms)
+    points = _hourly_samples("hl_oi.json", coin, live_oi, now_ms)
     return _trim_venue(bars, points, margin, leverage, "hyperliquid-usdc")
 
 
@@ -1042,51 +990,6 @@ def _iso_ms(text: str) -> int | None:
     if stamp.tzinfo is None:
         stamp = stamp.replace(tzinfo=timezone.utc)
     return int(stamp.timestamp() * 1000)
-
-
-_MAP_OI_LOCK = threading.Lock()
-
-
-def _map_oi_path() -> str:
-    root = os.environ.get("APPDATA") or os.path.expanduser("~")
-    folder = os.path.join(root, "CryptoHub")
-    os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, "map_oi.json")
-
-
-def _map_oi_series(key: str, live: float, now_ms: int) -> list[Point]:
-    """Borsa geçmişi olmayan kitapta her saat bir örnek. Tek örnek kütle yazmaz."""
-    path = _map_oi_path()
-    with _MAP_OI_LOCK:
-        stored: dict = {}
-        try:
-            with open(path, encoding="utf-8") as handle:
-                raw = json.load(handle)
-            if isinstance(raw, dict):
-                stored = raw
-        except (OSError, json.JSONDecodeError):
-            stored = {}
-        points: list[Point] = []
-        rows = stored.get(key)
-        if isinstance(rows, list):
-            for row in rows:
-                try:
-                    points.append(Point(int(row[0]), float(row[1])))
-                except (IndexError, TypeError, ValueError):
-                    continue
-        hour = now_ms // HOUR_MS * HOUR_MS
-        if live > 0 and (not points or points[-1].time_ms != hour):
-            points.append(Point(hour, live))
-        cutoff = hour - 40 * 24 * HOUR_MS
-        points = [point for point in points if point.time_ms >= cutoff and point.value > 0]
-        points.sort(key=lambda point: point.time_ms)
-        stored[key] = [[point.time_ms, point.value] for point in points]
-        try:
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(stored, handle)
-        except OSError:
-            pass
-        return points
 
 
 def _htx_leverage(url: str) -> tuple[float, int]:
@@ -1193,7 +1096,7 @@ def _htx_usd_venue(symbol: str) -> VenueBook | None:
 
 def _bitfinex_venue(symbol: str) -> VenueBook | None:
     coin = _coin(symbol)
-    key = f"t{coin}F0:USTF0"
+    key = _bitfinex_key(coin)
     payload = _read_json(
         f"https://api-pub.bitfinex.com/v2/candles/trade:1h:{quote(key, safe=':')}/hist?limit=1000&sort=-1"
     )
@@ -1312,7 +1215,7 @@ def _deribit_venue(symbol: str) -> VenueBook | None:
     if leverage < 1:
         leverage = 50
     margin = 1.0 / (2 * leverage)
-    points = _map_oi_series(f"deribit-usd:{coin}", live, now_ms)
+    points = _hourly_samples("map_oi.json", f"deribit-usd:{coin}", live, now_ms)
     return _trim_venue(bars, points, margin, leverage, "deribit-usd", True)
 
 
@@ -1373,7 +1276,7 @@ def _kraken_venue(symbol: str) -> VenueBook | None:
                     live = 0.0
                 break
     now_ms = int(time.time() * 1000)
-    points = _map_oi_series(f"kraken-usd:{coin}", live, now_ms)
+    points = _hourly_samples("map_oi.json", f"kraken-usd:{coin}", live, now_ms)
     return _trim_venue(bars, points, margin, leverage, "kraken-usd")
 
 
@@ -1488,7 +1391,7 @@ def _woo_venue(symbol: str) -> VenueBook | None:
         except (KeyError, TypeError, ValueError):
             live = 0.0
     now_ms = int(time.time() * 1000)
-    points = _map_oi_series(f"woo-usdt:{coin}", live, now_ms)
+    points = _hourly_samples("map_oi.json", f"woo-usdt:{coin}", live, now_ms)
     return _trim_venue(bars, points, margin, leverage, "woo-usdt")
 
 
@@ -1499,11 +1402,11 @@ def load_liquidity(symbol: str) -> LiquidityMap:
         _binance_venue,
         _binance_usdc_venue,
         _binance_usd_venue,
-        _bybit_venue,
-        _bybit_usdc_venue,
-        _bybit_usd_venue,
-        _okx_venue,
-        _okx_usd_venue,
+        lambda symbol: _bybit_book(symbol, "linear", "bybit-usdt", False),
+        lambda symbol: _bybit_book(f"{_coin(symbol)}PERP", "linear", "bybit-usdc", False),
+        lambda symbol: _bybit_book(f"{_coin(symbol)}USD", "inverse", "bybit-usd", True),
+        lambda symbol: _okx_book(*_okx_inst(symbol), "okx-usdt", False),
+        lambda symbol: _okx_book(f"{_coin(symbol)}-USD-SWAP", f"{_coin(symbol)}-USD", "okx-usd", True),
         _htx_usdt_venue,
         _htx_usd_venue,
         _bitfinex_venue,
@@ -1524,13 +1427,13 @@ def load_liquidity(symbol: str) -> LiquidityMap:
                 venues.append(venue)
     if not venues:
         raise MarketError(f"{symbol} likidasyon verisi yok")
-    book = merge_venues(symbol, venues)
+    book = merge_venues(symbol, venues, keep_columns=False)
     if not book.times:
         raise MarketError(f"{symbol} likidasyon verisi yok")
     return book
 
 
-def clip_map(book: LiquidityMap, hours: int, conserved: bool = False) -> LiquidityMap:
+def clip_map(book: LiquidityMap, hours: int, conserved: bool = False, keep_columns: bool = True) -> LiquidityMap:
     """Haritayı son N kapanmış saate indirir. Kaynak seri durur, ağdan yeniden istenmez."""
     if book.venues:
         clipped: list[VenueBook] = []
@@ -1549,13 +1452,15 @@ def clip_map(book: LiquidityMap, hours: int, conserved: bool = False) -> Liquidi
                         venue.inverse,
                     )
                 )
-        merged = merge_venues(book.symbol, clipped, conserved)
+        merged = merge_venues(book.symbol, clipped, conserved, keep_columns)
         merged.venues = book.venues
         return merged
     bars = book.source_bars[-hours:] if hours > 0 else list(book.source_bars)
     start = bars[0].time_ms if bars else 0
     oi_points = [point for point in book.source_oi if not bars or point.time_ms >= start - HOUR_MS]
-    clipped_book = build_map(book.symbol, bars, oi_points, book.margin, book.max_leverage, conserved)
+    clipped_book = build_map(
+        book.symbol, bars, oi_points, book.margin, book.max_leverage, conserved, keep_columns=keep_columns
+    )
     clipped_book.source_bars = book.source_bars
     clipped_book.source_oi = book.source_oi
     clipped_book.margin = book.margin

@@ -26,6 +26,19 @@ def main() -> None:
     assert wide is not None and wide[0] == 1 and wide[1] < equity
     assert abs(wide[2] * 0.20 - equity * risk / 100) < 1e-6
     assert plan_risk(equity, risk, entry, entry, 100) is None
+    raised = plan_risk(equity, risk, entry, stop, 100, user_floor=5)
+    assert raised is not None and raised[0] == 5 and raised[1] == equity and raised[2] == equity * 5
+    held = plan_risk(equity, risk, entry, 59_520.0, 100, user_floor=5)
+    assert held is not None and held[0] == 10 and held[1] == equity
+    wide_floor = plan_risk(equity, risk, entry, 48_000.0, 100, user_floor=5)
+    assert wide_floor is not None and wide_floor[0] == 5 and wide_floor[1] == equity
+    assert wide_floor[2] == equity * 5
+    over_max = plan_risk(equity, risk, entry, stop, 100, user_cap=8, user_floor=20)
+    assert over_max is not None and over_max[0] == 8 and over_max[1] == equity
+    over_cap = plan_risk(equity, risk, entry, 48_000.0, 10, user_floor=50)
+    assert over_cap is not None and over_cap[0] == 10 and over_cap[1] == equity
+    untouched = plan_risk(equity, risk, entry, 48_000.0, 100, user_floor=1)
+    assert untouched == wide
     print("risk hesabı geçti")
     print("kaldıraç", lever, "marjin", round(margin, 2), "büyüklük", round(notional, 2))
 
